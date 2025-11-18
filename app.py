@@ -20,10 +20,12 @@ USERS = {
     "main": "admin"
 }
 
+# Default playlist for dad, john, mark, james, ian, harry
 DEFAULT_M3U_URL = (
     "http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721"
 )
 
+# Custom playlists - John and main get their own
 USER_M3U_URLS = {
     "John": (
         "https://www.dropbox.com/scl/fi/h46n1fssly1ntasgg00id/"
@@ -53,6 +55,7 @@ def valid_user(username, password):
 
 
 def get_m3u_url_for_user(username):
+    """Return per-user playlist or default."""
     url = USER_M3U_URLS.get(username, DEFAULT_M3U_URL)
     print(f"[CONFIG] User '{username}' → {'CUSTOM' if username in USER_M3U_URLS else 'DEFAULT'} playlist")
     print(f"[CONFIG] URL: {url[:80]}...")
@@ -60,6 +63,7 @@ def get_m3u_url_for_user(username):
 
 
 def wants_json():
+    """Determine if client wants JSON response."""
     fmt = request.values.get("output", "").lower()
     if fmt == "json":
         return True
@@ -80,6 +84,7 @@ def wants_json():
 
 
 def list_to_xml(root_tag, item_tag, data_list):
+    """Convert list of dicts to XML string"""
     root = Element(root_tag)
     for item in data_list:
         item_elem = SubElement(root, item_tag)
@@ -129,6 +134,7 @@ def parse_m3u(text):
     attr_re = re.compile(r'(\w[\w-]*)="([^"]*)"')
     epg_url = None
 
+    # Extract EPG URL from M3U header
     if lines and lines[0].startswith("#EXTM3U"):
         header_attrs = dict(attr_re.findall(lines[0]))
         epg_url = header_attrs.get("url-tvg") or header_attrs.get("x-tvg-url")
@@ -182,11 +188,13 @@ def parse_m3u(text):
 
     return {"categories": categories, "streams": streams, "epg_url": epg_url}
 
-# ---------------- STREAM PROXY ----------------
+
+# ---------------- STREAM PROXY (FOR IPTV SMARTERS ONLY) ----------------
 
 def proxy_stream(url):
+    """Proxy the stream for clients that can't handle redirects (e.g. IPTV Smarters)."""
     try:
-        upstream = requests.get(url, headers=UA_HEADERS, stream=True, timeout=10)
+        upstream = requests.get(url, headers=UA_HEADERS, stream=True, timeout=25)
         upstream.raise_for_status()
 
         def generate():
@@ -196,47 +204,12 @@ def proxy_stream(url):
 
         content_type = upstream.headers.get("Content-Type", "application/octet-stream")
         return Response(generate(), content_type=content_type)
-
     except Exception as e:
         print(f"[PROXY ERROR] {e}")
         return Response("Stream unavailable", status=502)
 
-# ---------------- LIVE ROUTE ----------------
 
-@app.route("/live/<username>/<password>/<int:stream_id>.<ext>")
-@app.route("/live/<username>/<password>/<int:stream_id>")
-@app.route("/<username>/<password>/<int:stream_id>.<ext>")
-@app.route("/<username>/<password>/<int:stream_id>")
-def live(username, password, stream_id, ext=None):
-    if not valid_user(username, password):
-        return Response("Invalid credentials", status=403)
-
-    data = fetch_m3u_for_user(username)
-    for s in data["streams"]:
-        if s["stream_id"] == stream_id:
-            target_url = s["direct_source"]
-
-            ua = request.headers.get("User-Agent", "").lower()
-
-            # FIXED → Do NOT treat okhttp as Smarters
-            is_smarters = (
-                "iptv smarters" in ua or
-                "iptv_smarters" in ua or
-                "smarters" in ua     # but NOT okhttp
-            )
-
-            print(f"[STREAM] {username}:{stream_id} {s['name']}")
-            print(f"[STREAM] UA={ua}")
-            print(f"[STREAM] Mode: {'PROXY' if is_smarters else 'REDIRECT'}")
-
-            if is_smarters:
-                return proxy_stream(target_url)
-
-            return redirect(target_url, code=302)
-
-    return Response("Stream not found", status=404)
-
-# ---------------- THE REST OF YOUR APP (unchanged) ----------------
+# ---------------- ROUTES ----------------
 
 @app.route("/")
 def index():
@@ -247,23 +220,24 @@ def index():
         f"✅ Xtream Bridge (Multi-User)<br><br>"
         f"<b>Default:</b> {len(default.get('parsed', {}).get('streams', []))} streams<br>"
         f"<b>John:</b> {len(john.get('parsed', {}).get('streams', []))} streams<br>"
-        f"<b>Main:</b> {len(main.get('parsed', {}).get('parsed', {}).get('streams', []))} streams<br><br>"
+        f"<b>Main:</b> {len(main.get('parsed', {}).get('streams', []))} streams<br><br>"
         f"<a href='/whoami?username=main&password=admin'>🧭 Test Login</a> | "
         f"<a href='/debug'>🔍 Debug Users</a> | "
         f"<a href='/refresh'>🔄 Refresh Cache</a> | "
         f"<a href='/test_stream/1?username=main&password=admin'>🎬 Test Stream</a>"
     )
 
-# (all the remaining routes stay exactly the same — unchanged)
 
 @app.route("/debug")
 def debug_info():
+    """Show which URLs and files are currently mapped and cached."""
     info = ["<h2>🔍 User-to-Playlist Mapping</h2>"]
     
+    # Show what the code THINKS each user should get
     info.append("<h3>Expected Assignments:</h3>")
     for user in USERS.keys():
         expected_url = USER_M3U_URLS.get(user, DEFAULT_M3U_URL)
-        is_custom = user in USER_M4U_URLS
+        is_custom = user in USER_M3U_URLS
         info.append(f"<b>{user}</b>: {'CUSTOM' if is_custom else 'DEFAULT'} → {expected_url[:80]}...<br>")
     
     info.append("<hr><h3>Actual Cache Status:</h3>")
@@ -289,8 +263,11 @@ def debug_info():
     info.append("<br><a href='/'>← Back to Home</a> | <a href='/refresh'>🔄 Force Refresh Now</a>")
     return "".join(info)
 
-# (…etc. All other routes unchanged)
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+@app.route("/refresh")
+def refresh_all():
+    """Force clear and re-fetch all playlists."""
+    print("[INFO] 🔄 Manual full refresh triggered...")
+    _m3u_cache.clear()
+    fetch_m3u(DEFAULT_M3U_URL, "Default")
+    for user, url in USER
