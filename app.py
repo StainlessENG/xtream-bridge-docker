@@ -1,3 +1,4 @@
+
 import os
 import time
 import re
@@ -73,7 +74,7 @@ def wants_json():
     ua = request.headers.get("User-Agent", "").lower()
     accept = request.headers.get("Accept", "").lower()
 
-    if "smarters" in ua:
+    if "smarters" in ua or "okhttp" in ua:
         return True
     if "json" in accept:
         return True
@@ -188,27 +189,6 @@ def parse_m3u(text):
 
     return {"categories": categories, "streams": streams, "epg_url": epg_url}
 
-
-# ---------------- STREAM PROXY (FOR IPTV SMARTERS ONLY) ----------------
-
-def proxy_stream(url):
-    """Proxy the stream for clients that can't handle redirects (e.g. IPTV Smarters)."""
-    try:
-        upstream = requests.get(url, headers=UA_HEADERS, stream=True, timeout=25)
-        upstream.raise_for_status()
-
-        def generate():
-            for chunk in upstream.iter_content(chunk_size=1024 * 64):
-                if chunk:
-                    yield chunk
-
-        content_type = upstream.headers.get("Content-Type", "application/octet-stream")
-        return Response(generate(), content_type=content_type)
-    except Exception as e:
-        print(f"[PROXY ERROR] {e}")
-        return Response("Stream unavailable", status=502)
-
-
 # ---------------- ROUTES ----------------
 
 @app.route("/")
@@ -270,4 +250,234 @@ def refresh_all():
     print("[INFO] 🔄 Manual full refresh triggered...")
     _m3u_cache.clear()
     fetch_m3u(DEFAULT_M3U_URL, "Default")
-    for user, url in USER
+    for user, url in USER_M3U_URLS.items():
+        fetch_m3u(url, user)
+    return """
+    <h2>✅ Cache Refreshed</h2>
+    <p>All playlists have been forcibly refreshed and re-cached.</p>
+    <a href='/'>← Back to Home</a> | <a href='/debug'>Check Debug</a>
+    """
+
+
+@app.route("/whoami")
+def whoami():
+    """Show which playlist and cache info this user gets."""
+    username = request.args.get("username", "")
+    password = request.args.get("password", "")
+    
+    if not valid_user(username, password):
+        return jsonify({"error": "Invalid credentials"}), 403
+    
+    url = get_m3u_url_for_user(username)
+    cache = _m3u_cache.get(url, {})
+    
+    return jsonify({
+        "username": username,
+        "playlist_url": url,
+        "streams": len(cache.get("parsed", {}).get("streams", [])),
+        "last_fetch": cache.get("last_fetch", "Never"),
+        "is_custom": username in USER_M3U_URLS
+    })
+
+
+@app.route("/test_stream/<int:stream_id>")
+def test_stream(stream_id):
+    """Debug endpoint to test stream URLs directly"""
+    username = request.args.get("username", "main")
+    password = request.args.get("password", "admin")
+    
+    if not valid_user(username, password):
+        return "Invalid credentials", 403
+    
+    data = fetch_m3u_for_user(username)
+    for s in data["streams"]:
+        if s["stream_id"] == stream_id:
+            return f"""
+            <h3>Stream #{stream_id}: {s['name']}</h3>
+            <p><b>Direct URL:</b><br><textarea style="width:100%;height:60px">{s['direct_source']}</textarea></p>
+            <p><b>Xtream URL:</b><br>http://{request.host}/live/{username}/{password}/{stream_id}.m3u8</p>
+            <p><a href="{s['direct_source']}" target="_blank">Test Direct Link</a></p>
+            <p><a href="/live/{username}/{password}/{stream_id}.m3u8">Test Via Proxy</a></p>
+            """
+    
+    return "Stream not found", 404
+
+
+@app.route("/player_api.php", methods=["GET", "POST"])
+def player_api():
+    username = request.values.get("username", "")
+    password = request.values.get("password", "")
+    action = request.values.get("action", "")
+    use_json = wants_json()
+
+    print(f"[API] user={username}, action={action}, json={use_json}, UA={request.headers.get('User-Agent', '')[:40]}")
+
+    if not valid_user(username, password):
+        msg = {
+            "user_info": {
+                "username": username,
+                "password": password,
+                "message": "Invalid credentials",
+                "auth": 0,
+                "status": "Disabled"
+            }
+        }
+        if use_json:
+            return jsonify(msg), 403
+        else:
+            xml = '<?xml version="1.0"?><response><user_info><auth>0</auth><status>Disabled</status></user_info></response>'
+            return Response(xml, status=403, content_type="application/xml")
+
+    if action == "":
+        info = {
+            "user_info": {
+                "username": username,
+                "password": password,
+                "message": "Active",
+                "auth": 1,
+                "status": "Active",
+                "exp_date": None,
+                "is_trial": "0",
+                "active_cons": "0",
+                "created_at": "1640000000",
+                "max_connections": "1",
+                "allowed_output_formats": ["m3u8", "ts"]
+            },
+            "server_info": {
+                "url": request.host.split(":")[0],
+                "port": "80",
+                "https_port": "443",
+                "server_protocol": "http",
+                "rtmp_port": "1935",
+                "timezone": "UTC",
+                "timestamp_now": int(time.time()),
+                "time_now": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+        }
+        
+        if use_json:
+            return jsonify(info)
+        else:
+            xml = '<?xml version="1.0" encoding="UTF-8"?><response><user_info>'
+            for k, v in info["user_info"].items():
+                if isinstance(v, list):
+                    v = ",".join(v)
+                xml += f'<{k}>{v}</{k}>'
+            xml += '</user_info><server_info>'
+            for k, v in info["server_info"].items():
+                xml += f'<{k}>{v}</{k}>'
+            xml += '</server_info></response>'
+            return Response(xml, content_type="application/xml")
+
+    if action == "get_live_categories":
+        cats = fetch_m3u_for_user(username)["categories"]
+        if use_json:
+            return jsonify(cats)
+        else:
+            xml = list_to_xml("categories", "category", cats)
+            return Response(f'<?xml version="1.0"?>{xml}', content_type="application/xml")
+
+    if action == "get_live_streams":
+        data = fetch_m3u_for_user(username)
+        cat_filter = request.values.get("category_id")
+        streams = [s for s in data["streams"] 
+                   if not cat_filter or str(s["category_id"]) == str(cat_filter)]
+        
+        if use_json:
+            return jsonify(streams)
+        else:
+            xml = list_to_xml("streams", "channel", streams)
+            return Response(f'<?xml version="1.0"?>{xml}', content_type="application/xml")
+
+    if action == "get_account_info":
+        account_info = {
+            "username": username,
+            "password": password,
+            "message": "Active",
+            "auth": 1,
+            "status": "Active",
+            "exp_date": None,
+            "is_trial": "0",
+            "active_cons": "0",
+            "created_at": "1640000000",
+            "max_connections": "1"
+        }
+        if use_json:
+            return jsonify(account_info)
+        else:
+            xml = '<?xml version="1.0"?><user_info>'
+            for k, v in account_info.items():
+                xml += f'<{k}>{v}</{k}>'
+            xml += '</user_info>'
+            return Response(xml, content_type="application/xml")
+
+    if action in [
+        "get_vod_categories", "get_vod_streams", "get_series_categories",
+        "get_series", "get_series_info", "get_vod_info", "get_short_epg"
+    ]:
+        if use_json:
+            return jsonify([])
+        else:
+            return Response('<?xml version="1.0"?><response></response>', content_type="application/xml")
+
+    if use_json:
+        return jsonify({"error": "action not handled", "action": action})
+    else:
+        return Response(f'<?xml version="1.0"?><e>Unknown action: {action}</e>', 
+                      status=400, content_type="application/xml")
+
+
+@app.route("/live/<username>/<password>/<int:stream_id>.<ext>")
+@app.route("/live/<username>/<password>/<int:stream_id>")
+@app.route("/<username>/<password>/<int:stream_id>.<ext>")
+@app.route("/<username>/<password>/<int:stream_id>")
+def live(username, password, stream_id, ext=None):
+    if not valid_user(username, password):
+        return Response("Invalid credentials", status=403)
+
+    data = fetch_m3u_for_user(username)
+    for s in data["streams"]:
+        if s["stream_id"] == stream_id:
+            target_url = s["direct_source"]
+            
+            requested_ext = ext or "none"
+            actual_ext = "m3u8" if ".m3u8" in target_url else "ts" if ".ts" in target_url else "unknown"
+            print(f"[STREAM] User: {username}, Stream: {stream_id} ({s['name']}), Req ext: {requested_ext}, Actual: {actual_ext}")
+            print(f"[STREAM] Redirecting to: {target_url[:80]}...")
+            
+            return redirect(target_url, code=302)
+
+    return Response("Stream not found", status=404)
+
+
+@app.route("/xmltv.php")
+def xmltv():
+    username = request.args.get("username", "")
+    password = request.args.get("password", "")
+    if not valid_user(username, password):
+        return Response("Invalid credentials", status=403)
+    
+    data = fetch_m3u_for_user(username)
+    epg_url = data.get("epg_url")
+    
+    if not epg_url:
+        epg_url = "http://m3u4u.com/epg/476rnmqd4ds4rkd3nekg"
+        print(f"[EPG] No EPG in M3U for {username}, using fallback")
+    else:
+        print(f"[EPG] Using EPG from M3U for {username}: {epg_url[:60]}...")
+    
+    return redirect(epg_url)
+
+
+@app.route("/get.php")
+def get_m3u():
+    username = request.args.get("username", "")
+    password = request.args.get("password", "")
+    if not valid_user(username, password):
+        return Response("Invalid credentials", status=403)
+    return redirect(get_m3u_url_for_user(username))
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
