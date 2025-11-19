@@ -195,12 +195,6 @@ def admin_edit_user(user_id):
         user.m3u_url = request.form["m3u_url"]
         user.is_active = request.form.get("is_active") == "1"
         db.session.commit()
-
-        # Clear cached playlist for old URL if present
-        for k in list(M3U_CACHE.keys()):
-            if k == user.m3u_url:
-                del M3U_CACHE[k]
-
         return redirect(url_for("admin_users"))
 
     return render_template("user_form.html", user=user)
@@ -214,11 +208,11 @@ def admin_delete_user(user_id):
     return redirect(url_for("admin_users"))
 
 # ==========================================================
-#            M3U PARSER + CACHE (NO EPG)
+#            M3U PARSER + CACHE
 # ==========================================================
 
 M3U_CACHE = {}
-CACHE_TTL = 300  # seconds
+CACHE_TTL = 300
 
 def xtream_auth(username, password):
     u = User.query.filter_by(username=username, password=password).first()
@@ -239,7 +233,6 @@ def fetch_and_parse_m3u(url):
     while i < len(lines):
         line = lines[i]
         if line.startswith("#EXTINF"):
-            # name after the comma
             name_match = re.search(r",(.+)$", line)
             name = name_match.group(1) if name_match else "Unknown"
 
@@ -249,14 +242,14 @@ def fetch_and_parse_m3u(url):
             group_match = re.search(r'group-title="(.*?)"', line)
             group = group_match.group(1) if group_match else "Other"
 
-            url_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            stream_url = lines[i + 1].strip() if i + 1 < len(lines) else ""
 
             out.append({
                 "id": sid,
                 "name": name,
                 "logo": logo,
                 "group": group,
-                "url": url_line
+                "url": stream_url
             })
             sid += 1
         i += 1
@@ -269,16 +262,14 @@ def get_playlist_data(url):
     if url in M3U_CACHE and (now - M3U_CACHE[url]["ts"] < CACHE_TTL):
         return M3U_CACHE[url]
 
-    chans = fetch_and_parse_m3u(url)
-
-    # preserve category order from M3U
+    channels = fetch_and_parse_m3u(url)
     groups = []
-    for c in chans:
+    for c in channels:
         if c["group"] not in groups:
             groups.append(c["group"])
 
     M3U_CACHE[url] = {
-        "channels": chans,
+        "channels": channels,
         "groups": groups,
         "ts": now
     }
@@ -305,42 +296,68 @@ def player_api():
     host = request.host
     ua = request.headers.get("User-Agent", "").lower()
 
-    # host might be '192.168.1.10:5000' locally or 'xtream-bridge.onrender.com' on Render
+    # Render gives only domain (no port)
     if ":" in host:
-        ip, _ = host.split(":", 1)
+        ip = host.split(":")[0]
     else:
         ip = host
 
-    # ---------------- LOGIN (Smarters + IPTV Lite only) ----------------
+    # ---------------- LOGIN BLOCK ----------------
     if not action:
-        is_lite = ("iptv live" in ua) or ("cfnetwork" in ua) or ("darwin" in ua)
 
-        server_info = {
-            "url": ip,
-            "port": 443,          # assume HTTPS externally
-            "https_port": 443,
-            "server_protocol": "https",
-            "rtmp_port": 0,
-            "timezone": "Europe/London",
-            "timestamp_now": int(time.time())
-        }
+        is_lite = (
+            "iptv live" in ua or
+            "cfnetwork" in ua or
+            "darwin" in ua or
+            "iphone" in ua or
+            "ipad" in ua
+        )
 
-        user_info = {
-            "auth": 1,
-            "username": user.username,
-            "password": user.password,
-            "status": "Active",
-            "exp_date": None,
-            "max_connections": 1,
-        }
-
+        # ---------------- IPTV LITE ----------------
         if is_lite:
-            user_info["allowed_output_formats"] = ["ts"]
-        else:
-            # Smarters
-            user_info["allowed_output_formats"] = ["ts", "m3u8"]
+            return jsonify({
+                "user_info": {
+                    "auth": 1,
+                    "username": user.username,
+                    "password": user.password,
+                    "status": "Active",
+                    "exp_date": None,
+                    "max_connections": 1,
+                    "allowed_output_formats": ["ts"],
+                    "force_server_protocol": "https"   # <--- THIS FORCES HTTPS
+                },
+                "server_info": {
+                    "url": ip,
+                    "port": 443,
+                    "https_port": 443,
+                    "server_protocol": "https",
+                    "rtmp_port": 0,
+                    "timezone": "Europe/London",
+                    "timestamp_now": int(time.time())
+                }
+            })
 
-        return jsonify({"user_info": user_info, "server_info": server_info})
+        # ---------------- SMARTERS ----------------
+        return jsonify({
+            "user_info": {
+                "auth": 1,
+                "username": user.username,
+                "password": user.password,
+                "status": "Active",
+                "exp_date": None,
+                "max_connections": 1,
+                "allowed_output_formats": ["ts", "m3u8"]
+            },
+            "server_info": {
+                "url": ip,
+                "port": 443,
+                "https_port": 443,
+                "server_protocol": "https",
+                "rtmp_port": 0,
+                "timezone": "Europe/London",
+                "timestamp_now": int(time.time())
+            }
+        })
 
     # ---------------- LIVE CATEGORIES ----------------
     if action == "get_live_categories":
@@ -367,16 +384,17 @@ def player_api():
                 "direct_source": "",
                 "tv_archive": 0,
                 "container_extension": "ts",
-                # IPTV Lite and Smarters can both follow this
                 "stream_url": f"https://{ip}/live/{user.username}/{user.password}/{c['id']}.ts"
             })
 
         return Response(json.dumps(payload), mimetype="application/json")
 
-    # ---------------- MINIMAL VOD/SERIES (EMPTY) ----------------
-    if action in ["get_vod_categories", "get_vod_streams",
-                  "get_series_categories", "get_series",
-                  "get_series_info"]:
+    # ---------------- EMPTY ENDPOINTS ----------------
+    if action in [
+        "get_vod_categories", "get_vod_streams",
+        "get_series_categories", "get_series",
+        "get_series_info"
+    ]:
         return Response("[]", mimetype="application/json")
 
     return jsonify({"error": "Invalid action"})
@@ -399,11 +417,10 @@ def live_redirect(username, password, stream_id, ext):
     if not chan:
         return "Stream not found", 404
 
-    # just redirect to provider URL
     return redirect(chan["url"], code=302)
 
 # ==========================================================
-#                     ROOT (for iOS checks)
+#                     ROOT CHECK
 # ==========================================================
 
 @app.route("/")
