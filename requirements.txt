@@ -1,3 +1,6 @@
-flask
+Flask
 requests
+SQLAlchemy
+Flask_SQLAlchemy
+jinja2
 gunicorn
