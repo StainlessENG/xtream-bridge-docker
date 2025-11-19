@@ -1,4 +1,3 @@
-
 import os
 import time
 import re
@@ -29,9 +28,7 @@ DEFAULT_M3U_URL = (
 # Custom playlists - John and main get their own
 USER_M3U_URLS = {
     "John": (
-        "https://www.dropbox.com/scl/fi/h46n1fssly1ntasgg00id/"
-        "m3u4u-102864-35343-MergedPlaylist.m3u?"
-        "rlkey=7rgc5z8g5znxfgla17an50smz&st=ekopupn5&dl=1"
+        "http://m3u4u.com/m3u/5g28nejz1zhv45q3yzpe"
     ),
     "main": (
         "http://m3u4u.com/m3u/p87vnr8dzdu4w2q6n41j"
@@ -382,6 +379,16 @@ def player_api():
         cat_filter = request.values.get("category_id")
         streams = [s for s in data["streams"] 
                    if not cat_filter or str(s["category_id"]) == str(cat_filter)]
+        
+        # SPECIAL: Force John and john's streams through our bridge for Smarters compatibility
+        if username in ["John", "john"]:
+            server_url = request.host
+            user_password = USERS[username]  # Get their actual password
+            for stream in streams:
+                stream_id = stream["stream_id"]
+                # Rewrite direct_source to force through our server
+                stream["direct_source"] = f"http://{server_url}/live/{username}/{user_password}/{stream_id}.m3u8"
+            print(f"[SMARTERS-FIX] {username}: {len(streams)} streams rewritten to use bridge")
         
         if use_json:
             return jsonify(streams)
