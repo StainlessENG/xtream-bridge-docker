@@ -18,12 +18,12 @@ from jinja2 import DictLoader
 # ==========================================================
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "changeme"
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "changeme")
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///xtream_users.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "adminpass"
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "adminpass")
 
 db = SQLAlchemy(app)
 
@@ -90,7 +90,7 @@ USERS_LIST_TEMPLATE = """
 <p><a href="{{ url_for('admin_new_user') }}">+ New User</a></p>
 
 <table border="1" cellpadding="6">
-<tr><th>ID</th><th>User</</th><th>M3U URL</th><th>Active</th><th>Actions</th></tr>
+<tr><th>ID</th><th>User</th><th>M3U URL</th><th>Active</th><th>Actions</th></tr>
 {% for u in users %}
 <tr>
 <td>{{u.id}}</td>
@@ -197,7 +197,7 @@ def admin_edit_user(user_id):
         user.is_active = request.form.get("is_active") == "1"
         db.session.commit()
 
-        # Clear cache when user M3U changes (playlist + epg)
+        # Clear playlist + EPG when changing M3U
         if old_m3u in M3U_CACHE:
             del M3U_CACHE[old_m3u]
         for k in list(M3U_CACHE.keys()):
@@ -217,12 +217,12 @@ def admin_delete_user(user_id):
     return redirect(url_for("admin_users"))
 
 # ==========================================================
-#                M3U PARSER + CACHE + EPG
+#            M3U PARSER + CACHE + EPG PARSING
 # ==========================================================
 
 M3U_CACHE = {}
-CACHE_TTL = 300  # seconds
-EPG_TTL = 600    # seconds
+CACHE_TTL = 300
+EPG_TTL = 600
 
 def xtream_auth(username, password):
     u = User.query.filter_by(username=username, password=password).first()
@@ -238,7 +238,7 @@ def fetch_and_parse_m3u(url):
     lines = text.splitlines()
     epg_url = None
 
-    # Extract global EPG URL from #EXTM3U url-tvg="..."
+    # Extract EPG from #EXTM3U
     if lines and lines[0].startswith("#EXTM3U"):
         m = re.search(r'url-tvg="(.*?)"', lines[0])
         if m:
@@ -263,7 +263,6 @@ def fetch_and_parse_m3u(url):
             tvg_id_match = re.search(r'tvg-id="(.*?)"', line)
             tvg_id = tvg_id_match.group(1) if tvg_id_match else ""
 
-            # stream URL on next line
             url_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
 
             out.append({
@@ -287,7 +286,6 @@ def get_playlist_data(url):
 
     chans, epg_url = fetch_and_parse_m3u(url)
 
-    # Preserve EXACT category order from M3U
     groups = []
     for c in chans:
         if c["group"] not in groups:
@@ -319,16 +317,13 @@ def player_api():
     channels = playlist["channels"]
     groups = playlist["groups"]
 
-    host = request.host  # includes port, e.g. "192.168.1.106:5000"
+    host = request.host
     ip, port = host.split(":")
 
     ua = request.headers.get("User-Agent", "").lower()
 
-    # ======================================================
-    #               LOGIN RESPONSE
-    # ======================================================
+    # LOGIN RESPONSE
     if not action:
-        # Detect IPTV Lite style UA
         is_lite = ("iptv live" in ua) or ("cfnetwork" in ua) or ("darwin" in ua)
 
         if is_lite:
@@ -344,7 +339,7 @@ def player_api():
                 },
                 "server_info": {
                     "url": ip,
-                    "port": int(port),   # IMPORTANT: correct port for Lite
+                    "port": int(port),
                     "https_port": 443,
                     "server_protocol": "http",
                     "timezone": "Europe/London",
@@ -352,7 +347,7 @@ def player_api():
                 }
             })
 
-        # Default (Smarters/TiviMate/etc.)
+        # Smarters / TiviMate
         return jsonify({
             "user_info": {
                 "auth": 1,
@@ -373,9 +368,7 @@ def player_api():
             }
         })
 
-    # ======================================================
-    #                LIVE CATEGORIES
-    # ======================================================
+    # CATEGORIES
     if action == "get_live_categories":
         payload = [
             {"category_id": str(i + 1), "category_name": g, "parent_id": 0}
@@ -383,9 +376,7 @@ def player_api():
         ]
         return Response(json.dumps(payload), mimetype="application/json")
 
-    # ======================================================
-    #                 LIVE STREAMS
-    # ======================================================
+    # STREAMS
     if action == "get_live_streams":
         cat_map = {g: (i + 1) for i, g in enumerate(groups)}
 
@@ -403,14 +394,11 @@ def player_api():
                 "tv_archive": 0,
                 "container_extension": "ts",
                 "epg_channel_id": c.get("tvg_id", ""),
-                "stream_url": f"http://{ip}:{port}/live/{user.username}/{user.password}/{c['id']}.ts"
+                "stream_url": f"https://{ip}/live/{user.username}/{user.password}/{c['id']}.ts"
             })
 
         return Response(json.dumps(payload), mimetype="application/json")
 
-    # ======================================================
-    #        IPTV Lite required empty endpoints (VOD/SERIES)
-    # ======================================================
     if action in ["get_vod_categories", "get_vod_streams",
                   "get_series_categories", "get_series", "get_series_info"]:
         return Response("[]", mimetype="application/json")
@@ -418,7 +406,7 @@ def player_api():
     return jsonify({"error": "Invalid action"})
 
 # ==========================================================
-#                       XMLTV (EPG)
+#                      XMLTV EPG
 # ==========================================================
 
 @app.route("/xmltv.php")
@@ -434,7 +422,6 @@ def xmltv():
     epg_url = playlist.get("epg_url")
 
     if not epg_url:
-        # No EPG linked in M3U
         return Response("<tv></tv>", mimetype="application/xml")
 
     cache_key = "EPG_" + epg_url
@@ -457,12 +444,12 @@ def xmltv():
     return Response(xml, mimetype="application/xml")
 
 # ==========================================================
-#                   STREAM REDIRECTOR
+#                   STREAM REDIRECT
 # ==========================================================
 
 @app.route("/live/<username>/<password>/<int:stream_id>.<ext>")
 def live_redirect(username, password, stream_id, ext):
-    print(f"[STREAM REQUEST] {username} {stream_id}.{ext}")
+    print(f"[STREAM REQUEST] {username} -> {stream_id}.{ext}")
 
     user = xtream_auth(username, password)
     if not user:
@@ -477,8 +464,17 @@ def live_redirect(username, password, stream_id, ext):
     return redirect(chan["url"], code=302)
 
 # ==========================================================
+#                   ROOT (Fix for IPTV Lite)
+# ==========================================================
+
+@app.route("/")
+def root():
+    return "Xtream API Server OK", 200
+
+# ==========================================================
 #                        RUN SERVER
 # ==========================================================
 
 if __name__ == "__main__":
+    # Local testing mode
     app.run(host="0.0.0.0", port=5000)
