@@ -377,8 +377,13 @@ def player_api():
     if action == "get_live_streams":
         data = fetch_m3u_for_user(username)
         cat_filter = request.values.get("category_id")
-        streams = [s for s in data["streams"] 
-                   if not cat_filter or str(s["category_id"]) == str(cat_filter)]
+
+        # Work on a COPY of each stream so we don't mutate the cache
+        streams = []
+        for s in data["streams"]:
+            if cat_filter and str(s["category_id"]) != str(cat_filter):
+                continue
+            streams.append(dict(s))  # shallow copy of each stream dict
         
         # SPECIAL: Force John and john's streams through our bridge for Smarters compatibility
         if username in ["John", "john"]:
@@ -386,10 +391,9 @@ def player_api():
             user_password = USERS[username]  # Get their actual password
             for stream in streams:
                 stream_id = stream["stream_id"]
-                # Rewrite direct_source to force through our server
                 stream["direct_source"] = f"http://{server_url}/live/{username}/{user_password}/{stream_id}.m3u8"
             print(f"[SMARTERS-FIX] {username}: {len(streams)} streams rewritten to use bridge")
-        
+
         if use_json:
             return jsonify(streams)
         else:
@@ -443,18 +447,49 @@ def live(username, password, stream_id, ext=None):
         return Response("Invalid credentials", status=403)
 
     data = fetch_m3u_for_user(username)
+    target_stream = None
     for s in data["streams"]:
         if s["stream_id"] == stream_id:
-            target_url = s["direct_source"]
-            
-            requested_ext = ext or "none"
-            actual_ext = "m3u8" if ".m3u8" in target_url else "ts" if ".ts" in target_url else "unknown"
-            print(f"[STREAM] User: {username}, Stream: {stream_id} ({s['name']}), Req ext: {requested_ext}, Actual: {actual_ext}")
-            print(f"[STREAM] Redirecting to: {target_url[:80]}...")
-            
-            return redirect(target_url, code=302)
+            target_stream = s
+            break
 
-    return Response("Stream not found", status=404)
+    if not target_stream:
+        return Response("Stream not found", status=404)
+
+    upstream_url = target_stream.get("direct_source")
+    if not upstream_url:
+        return Response("Upstream URL missing", status=500)
+
+    requested_ext = ext or "none"
+    actual_ext = "m3u8" if ".m3u8" in upstream_url else "ts" if ".ts" in upstream_url else "unknown"
+    print(f"[STREAM] User: {username}, Stream: {stream_id} ({target_stream['name']}), Req ext: {requested_ext}, Actual: {actual_ext}")
+    print(f"[STREAM] Upstream URL: {upstream_url[:80]}...")
+
+    # FULL PROXY MODE for John/john
+    if username in ["John", "john"]:
+        print(f"[PROXY] Streaming via proxy for {username}, stream {stream_id}")
+        try:
+            upstream_resp = requests.get(upstream_url, headers=UA_HEADERS, stream=True, timeout=20)
+
+            def generate():
+                for chunk in upstream_resp.iter_content(chunk_size=1024 * 32):
+                    if not chunk:
+                        continue
+                    yield chunk
+
+            # Keep only essential headers
+            headers = {}
+            content_type = upstream_resp.headers.get("Content-Type")
+            if content_type:
+                headers["Content-Type"] = content_type
+
+            return Response(generate(), status=upstream_resp.status_code, headers=headers)
+        except Exception as e:
+            print(f"[ERROR] Proxy stream failed for {username}, stream {stream_id}: {e}")
+            return Response("Stream error", status=500)
+
+    # Everyone else: regular redirect to upstream
+    return redirect(upstream_url, code=302)
 
 
 @app.route("/xmltv.php")
