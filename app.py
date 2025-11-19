@@ -60,7 +60,7 @@ BASE_TEMPLATE = """
 </header>
 <hr>
 
-{% with msgs = get_flashed_messages(with_categories=true) %}
+{% with msgs = get_flasched_messages(with_categories=true) %}
   {% for c,m in msgs %}
     <p><b>{{c}}</b>: {{m}}</p>
   {% endfor %}
@@ -69,7 +69,7 @@ BASE_TEMPLATE = """
 {% block content %}{% endblock %}
 </body>
 </html>
-"""
+""".replace("flasched", "flashed")  # tiny typo fix
 
 LOGIN_TEMPLATE = """
 {% extends "base.html" %}
@@ -296,9 +296,8 @@ def player_api():
     host = request.host
     ua = request.headers.get("User-Agent", "").lower()
 
-    # Render gives only domain (no port)
     if ":" in host:
-        ip = host.split(":")[0]
+        ip = host.split(":", 1)[0]
     else:
         ip = host
 
@@ -324,7 +323,7 @@ def player_api():
                     "exp_date": None,
                     "max_connections": 1,
                     "allowed_output_formats": ["ts"],
-                    "force_server_protocol": "https"   # <--- THIS FORCES HTTPS
+                    "force_server_protocol": "https"
                 },
                 "server_info": {
                     "url": ip,
@@ -371,8 +370,29 @@ def player_api():
     if action == "get_live_streams":
         cat_map = {g: (i + 1) for i, g in enumerate(groups)}
 
+        ua = request.headers.get("User-Agent", "").lower()
+        is_lite = (
+            "iptv live" in ua or
+            "cfnetwork" in ua or
+            "darwin" in ua or
+            "iphone" in ua or
+            "ipad" in ua
+        )
+
         payload = []
         for c in channels:
+            https_url = f"https://{ip}/live/{user.username}/{user.password}/{c['id']}.ts"
+
+            if is_lite:
+                # IPTV Lite tends to ignore stream_url and rebuild it.
+                # Put the real HTTPS URL into direct_source instead.
+                stream_url = ""
+                direct_source = https_url
+            else:
+                # Smarters and others are fine with stream_url.
+                stream_url = https_url
+                direct_source = ""
+
             payload.append({
                 "num": c["id"],
                 "stream_id": c["id"],
@@ -381,10 +401,10 @@ def player_api():
                 "stream_icon": c["logo"],
                 "category_id": str(cat_map.get(c["group"], 0)),
                 "custom_sid": "",
-                "direct_source": "",
+                "direct_source": direct_source,
                 "tv_archive": 0,
                 "container_extension": "ts",
-                "stream_url": f"https://{ip}/live/{user.username}/{user.password}/{c['id']}.ts"
+                "stream_url": stream_url
             })
 
         return Response(json.dumps(payload), mimetype="application/json")
