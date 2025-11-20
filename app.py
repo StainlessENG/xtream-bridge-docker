@@ -60,7 +60,7 @@ BASE_TEMPLATE = """
 </header>
 <hr>
 
-{% with msgs = get_flasched_messages(with_categories=true) %}
+{% with msgs = get_flashed_messages(with_categories=true) %}
   {% for c,m in msgs %}
     <p><b>{{c}}</b>: {{m}}</p>
   {% endfor %}
@@ -69,7 +69,7 @@ BASE_TEMPLATE = """
 {% block content %}{% endblock %}
 </body>
 </html>
-""".replace("flasched", "flashed")  # tiny typo fix
+"""
 
 LOGIN_TEMPLATE = """
 {% extends "base.html" %}
@@ -93,16 +93,16 @@ USERS_LIST_TEMPLATE = """
 <tr><th>ID</th><th>User</th><th>M3U URL</th><th>Active</th><th>Actions</th></tr>
 {% for u in users %}
 <tr>
-<td>{{u.id}}</td>
-<td>{{u.username}}</td>
-<td style="max-width:300px;word-break:break-all">{{u.m3u_url}}</td>
-<td>{{"Yes" if u.is_active else "No"}}</td>
-<td>
-  <a href="{{url_for('admin_edit_user', user_id=u.id)}}">Edit</a> |
-  <form method="post" action="{{url_for('admin_delete_user',user_id=u.id)}}" style="display:inline">
-    <button onclick="return confirm('Delete?')">Delete</button>
-  </form>
-</td>
+  <td>{{u.id}}</td>
+  <td>{{u.username}}</td>
+  <td style="max-width:300px;word-break:break-all">{{u.m3u_url}}</td>
+  <td>{{"Yes" if u.is_active else "No"}}</td>
+  <td>
+    <a href="{{url_for('admin_edit_user', user_id=u.id)}}">Edit</a> |
+    <form method="post" action="{{url_for('admin_delete_user',user_id=u.id)}}" style="display:inline">
+      <button onclick="return confirm('Delete?')">Delete</button>
+    </form>
+  </td>
 </tr>
 {% endfor %}
 </table>
@@ -208,31 +208,50 @@ def admin_delete_user(user_id):
     return redirect(url_for("admin_users"))
 
 # ==========================================================
-#            M3U PARSER + CACHE
+#            M3U / EPG PARSER + CACHE
 # ==========================================================
 
 M3U_CACHE = {}
-CACHE_TTL = 300
+EPG_CACHE = {}
+PLAYLIST_TTL = 300   # seconds
+EPG_TTL = 600        # seconds
 
 def xtream_auth(username, password):
     u = User.query.filter_by(username=username, password=password).first()
     return u if u and u.is_active else None
 
 def fetch_and_parse_m3u(url):
+    """
+    Returns (channels, groups, epg_url)
+    channels: list of {id, name, logo, group, url, tvg_id}
+    groups: category names in the order they appear
+    epg_url: from #EXTM3U url-tvg="..."
+    """
     try:
         text = requests.get(url, timeout=15).text
     except Exception as e:
         print("Error fetching M3U:", e)
-        return []
+        return [], [], None
 
     lines = text.splitlines()
-    out = []
-    sid = 1000
+    epg_url = None
+
+    # First line: #EXTM3U url-tvg="..."
+    if lines and lines[0].startswith("#EXTM3U"):
+        m = re.search(r'url-tvg="(.*?)"', lines[0])
+        if m:
+            epg_url = m.group(1)
+
+    channels = []
+    groups = []
+    stream_id = 1
     i = 0
 
     while i < len(lines):
-        line = lines[i]
+        line = lines[i].strip()
+
         if line.startswith("#EXTINF"):
+            # Channel name after the comma
             name_match = re.search(r",(.+)$", line)
             name = name_match.group(1) if name_match else "Unknown"
 
@@ -242,35 +261,41 @@ def fetch_and_parse_m3u(url):
             group_match = re.search(r'group-title="(.*?)"', line)
             group = group_match.group(1) if group_match else "Other"
 
-            stream_url = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            tvg_id_match = re.search(r'tvg-id="(.*?)"', line)
+            tvg_id = tvg_id_match.group(1) if tvg_id_match else ""
 
-            out.append({
-                "id": sid,
+            # Next line: actual stream URL
+            stream_url = ""
+            if i + 1 < len(lines):
+                stream_url = lines[i + 1].strip()
+
+            if group not in groups:
+                groups.append(group)
+
+            channels.append({
+                "id": stream_id,
                 "name": name,
                 "logo": logo,
                 "group": group,
-                "url": stream_url
+                "url": stream_url,
+                "tvg_id": tvg_id
             })
-            sid += 1
+            stream_id += 1
+
         i += 1
 
-    return out
+    return channels, groups, epg_url
 
 def get_playlist_data(url):
     now = time.time()
-
-    if url in M3U_CACHE and (now - M3U_CACHE[url]["ts"] < CACHE_TTL):
+    if url in M3U_CACHE and (now - M3U_CACHE[url]["ts"] < PLAYLIST_TTL):
         return M3U_CACHE[url]
 
-    channels = fetch_and_parse_m3u(url)
-    groups = []
-    for c in channels:
-        if c["group"] not in groups:
-            groups.append(c["group"])
-
+    channels, groups, epg_url = fetch_and_parse_m3u(url)
     M3U_CACHE[url] = {
         "channels": channels,
         "groups": groups,
+        "epg_url": epg_url,
         "ts": now
     }
     return M3U_CACHE[url]
@@ -294,69 +319,37 @@ def player_api():
     groups = playlist["groups"]
 
     host = request.host
-    ua = request.headers.get("User-Agent", "").lower()
-
     if ":" in host:
         ip = host.split(":", 1)[0]
     else:
         ip = host
 
-    # ---------------- LOGIN BLOCK ----------------
+    # ---------------- LOGIN (no action) ----------------
     if not action:
+        user_info = {
+            "auth": 1,
+            "username": user.username,
+            "password": user.password,
+            "status": "Active",
+            "exp_date": None,
+            "is_trial": "0",
+            "active_cons": 0,
+            "created_at": str(user.created_at),
+            "max_connections": 1,
+            "allowed_output_formats": ["ts", "m3u8"]
+        }
 
-        is_lite = (
-            "iptv live" in ua or
-            "cfnetwork" in ua or
-            "darwin" in ua or
-            "iphone" in ua or
-            "ipad" in ua
-        )
+        server_info = {
+            "url": ip,
+            "port": 443,
+            "https_port": 443,
+            "server_protocol": "https",
+            "rtmp_port": 0,
+            "timezone": "Europe/London",
+            "timestamp_now": int(time.time())
+        }
 
-        # ---------------- IPTV LITE ----------------
-        if is_lite:
-            return jsonify({
-                "user_info": {
-                    "auth": 1,
-                    "username": user.username,
-                    "password": user.password,
-                    "status": "Active",
-                    "exp_date": None,
-                    "max_connections": 1,
-                    "allowed_output_formats": ["ts"],
-                    "force_server_protocol": "https"
-                },
-                "server_info": {
-                    "url": ip,
-                    "port": 443,
-                    "https_port": 443,
-                    "server_protocol": "https",
-                    "rtmp_port": 0,
-                    "timezone": "Europe/London",
-                    "timestamp_now": int(time.time())
-                }
-            })
-
-        # ---------------- SMARTERS ----------------
-        return jsonify({
-            "user_info": {
-                "auth": 1,
-                "username": user.username,
-                "password": user.password,
-                "status": "Active",
-                "exp_date": None,
-                "max_connections": 1,
-                "allowed_output_formats": ["ts", "m3u8"]
-            },
-            "server_info": {
-                "url": ip,
-                "port": 443,
-                "https_port": 443,
-                "server_protocol": "https",
-                "rtmp_port": 0,
-                "timezone": "Europe/London",
-                "timestamp_now": int(time.time())
-            }
-        })
+        return jsonify({"user_info": user_info, "server_info": server_info})
 
     # ---------------- LIVE CATEGORIES ----------------
     if action == "get_live_categories":
@@ -370,29 +363,8 @@ def player_api():
     if action == "get_live_streams":
         cat_map = {g: (i + 1) for i, g in enumerate(groups)}
 
-        ua = request.headers.get("User-Agent", "").lower()
-        is_lite = (
-            "iptv live" in ua or
-            "cfnetwork" in ua or
-            "darwin" in ua or
-            "iphone" in ua or
-            "ipad" in ua
-        )
-
         payload = []
         for c in channels:
-            https_url = f"https://{ip}/live/{user.username}/{user.password}/{c['id']}.ts"
-
-            if is_lite:
-                # IPTV Lite tends to ignore stream_url and rebuild it.
-                # Put the real HTTPS URL into direct_source instead.
-                stream_url = ""
-                direct_source = https_url
-            else:
-                # Smarters and others are fine with stream_url.
-                stream_url = https_url
-                direct_source = ""
-
             payload.append({
                 "num": c["id"],
                 "stream_id": c["id"],
@@ -401,15 +373,16 @@ def player_api():
                 "stream_icon": c["logo"],
                 "category_id": str(cat_map.get(c["group"], 0)),
                 "custom_sid": "",
-                "direct_source": direct_source,
+                "direct_source": "",
                 "tv_archive": 0,
+                "epg_channel_id": c.get("tvg_id", ""),
                 "container_extension": "ts",
-                "stream_url": stream_url
+                "stream_url": f"https://{ip}/live/{user.username}/{user.password}/{c['id']}.ts"
             })
 
         return Response(json.dumps(payload), mimetype="application/json")
 
-    # ---------------- EMPTY ENDPOINTS ----------------
+    # ---------------- MINIMAL VOD/SERIES (EMPTY) ----------------
     if action in [
         "get_vod_categories", "get_vod_streams",
         "get_series_categories", "get_series",
@@ -418,6 +391,38 @@ def player_api():
         return Response("[]", mimetype="application/json")
 
     return jsonify({"error": "Invalid action"})
+
+# ==========================================================
+#                      XMLTV EPG
+# ==========================================================
+
+@app.route("/xmltv.php")
+def xmltv():
+    username = request.args.get("username")
+    password = request.args.get("password")
+
+    user = xtream_auth(username, password)
+    if not user:
+        return "Auth failed", 401
+
+    playlist = get_playlist_data(user.m3u_url)
+    epg_url = playlist.get("epg_url")
+
+    if not epg_url:
+        return Response("<tv></tv>", mimetype="application/xml")
+
+    now = time.time()
+    if epg_url in EPG_CACHE and (now - EPG_CACHE[epg_url]["ts"] < EPG_TTL):
+        return Response(EPG_CACHE[epg_url]["xml"], mimetype="application/xml")
+
+    try:
+        xml = requests.get(epg_url, timeout=20).text
+    except Exception as e:
+        print("Error fetching EPG:", e)
+        xml = "<tv></tv>"
+
+    EPG_CACHE[epg_url] = {"xml": xml, "ts": now}
+    return Response(xml, mimetype="application/xml")
 
 # ==========================================================
 #                   STREAM REDIRECT
