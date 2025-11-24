@@ -1,6 +1,3 @@
-Flask
+fastapi
+uvicorn
 requests
-SQLAlchemy
-Flask_SQLAlchemy
-jinja2
-gunicorn
