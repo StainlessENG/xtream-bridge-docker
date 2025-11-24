@@ -1,6 +1,6 @@
 
-from fastapi import FastAPI, Query
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse, StreamingResponse
 import requests
 import time
 from datetime import datetime
@@ -8,22 +8,18 @@ import re
 
 app = FastAPI()
 
-# Your playlist and EPG URLs
 M3U_URL = "http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721"
 EPG_URL = "http://m3u4u.com/xml/p87vnr8dzdu4w2q6n41j"
 
-# Credentials
 USERNAME = "John"
 PASSWORD = "Sidford2025"
 
 @app.get("/player_api.php")
 def player_api(username: str, password: str, action: str = None):
-    # Authentication
     if username != USERNAME or password != PASSWORD:
         return {"user_info": {"auth": 0, "status": "Failed"}}
 
-    # Fetch playlist
-    response = requests.get(M3U_URL)
+    response = requests.get(M3U_URL, timeout=30)
     if response.status_code != 200:
         return {"error": "Failed to fetch playlist"}
 
@@ -32,7 +28,6 @@ def player_api(username: str, password: str, action: str = None):
     categories_map = {}
     category_counter = 1
 
-    # Parse M3U for channels and categories
     for i in range(len(lines)):
         if lines[i].startswith("#EXTINF"):
             name = lines[i].split(",")[-1]
@@ -44,7 +39,7 @@ def player_api(username: str, password: str, action: str = None):
                 category_counter += 1
 
             category_id = categories_map[category_name]
-            url = lines[i+1] if i+1 < len(lines) else ""
+            url = lines[i+1].strip() if i+1 < len(lines) else ""
 
             channels.append({
                 "num": i,
@@ -57,19 +52,18 @@ def player_api(username: str, password: str, action: str = None):
                 "category_id": category_id,
                 "custom_sid": "",
                 "tv_archive": 0,
-                "direct_source": url
+                "direct_source": url,
+                "url": f"https://xtream-bridge.onrender.com/live/{USERNAME}/{PASSWORD}/{i}.ts"
             })
 
     categories = [{"category_id": cid, "category_name": cname, "parent_id": 0}
                   for cname, cid in categories_map.items()]
 
-    # Handle IPTV Smarters actions
     if action == "get_live_categories":
         return categories
     elif action == "get_live_streams":
         return channels
     else:
-        # Default login response
         return {
             "user_info": {
                 "username": username,
@@ -104,3 +98,19 @@ def get_epg(username: str, password: str):
     if username != USERNAME or password != PASSWORD:
         return "<xmltv></xmltv>"
     return requests.get(EPG_URL).text
+
+@app.get("/live/{username}/{password}/{stream_id}.ts")
+def proxy_stream(username: str, password: str, stream_id: int):
+    if username != USERNAME or password != PASSWORD:
+        return PlainTextResponse("Authentication Failed", status_code=403)
+
+    response = requests.get(M3U_URL, timeout=30)
+    lines = response.text.splitlines()
+    urls = [lines[i+1].strip() for i in range(len(lines)) if lines[i].startswith("#EXTINF")]
+
+    if stream_id >= len(urls):
+        return PlainTextResponse("Stream Not Found", status_code=404)
+
+    stream_url = urls[stream_id]
+    r = requests.get(stream_url, stream=True)
+    return StreamingResponse(r.iter_content(chunk_size=1024), media_type="video/MP2T")
