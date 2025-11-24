@@ -17,7 +17,8 @@ USERNAME = "John"
 PASSWORD = "Sidford2025"
 
 @app.get("/player_api.php")
-def player_api(username: str, password: str):
+def player_api(username: str, password: str, action: str = None):
+    # Authentication
     if username != USERNAME or password != PASSWORD:
         return {"user_info": {"auth": 0, "status": "Failed"}}
 
@@ -31,23 +32,18 @@ def player_api(username: str, password: str):
     categories_map = {}
     category_counter = 1
 
+    # Parse M3U for channels and categories
     for i in range(len(lines)):
         if lines[i].startswith("#EXTINF"):
-            # Extract channel name
             name = lines[i].split(",")[-1]
-
-            # Extract group-title
             match = re.search(r'group-title="([^"]+)"', lines[i])
             category_name = match.group(1) if match else "Other"
 
-            # Assign category_id
             if category_name not in categories_map:
                 categories_map[category_name] = str(category_counter)
                 category_counter += 1
 
             category_id = categories_map[category_name]
-
-            # Channel URL
             url = lines[i+1] if i+1 < len(lines) else ""
 
             channels.append({
@@ -64,37 +60,38 @@ def player_api(username: str, password: str):
                 "direct_source": url
             })
 
-    # Build categories list
     categories = [{"category_id": cid, "category_name": cname, "parent_id": 0}
                   for cname, cid in categories_map.items()]
 
-    return {
-        "user_info": {
-            "username": username,
-            "password": password,
-            "message": "",
-            "auth": 1,
-            "status": "Active",
-            "exp_date": "0000-00-00 00:00:00",
-            "is_trial": "0",
-            "active_cons": "1",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "max_connections": "1"
-        },
-        "server_info": {
-            "url": "your-render-domain.onrender.com",
-            "port": "443",
-            "https": True,
-            "server_protocol": "https",
-            "rtmp_port": "8000",
-            "timezone": "Europe/London",
-            "timestamp_now": int(time.time())
-        },
-        "categories": categories,
-        "available_channels": channels,
-        "available_movies": [],
-        "available_series": []
-    }
+    # Handle IPTV Smarters actions
+    if action == "get_live_categories":
+        return categories
+    elif action == "get_live_streams":
+        return channels
+    else:
+        # Default login response
+        return {
+            "user_info": {
+                "username": username,
+                "password": password,
+                "auth": 1,
+                "status": "Active",
+                "exp_date": "0000-00-00 00:00:00",
+                "is_trial": "0",
+                "active_cons": "1",
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "max_connections": "1"
+            },
+            "server_info": {
+                "url": "xtream-bridge.onrender.com",
+                "port": "443",
+                "https": True,
+                "server_protocol": "https",
+                "rtmp_port": "8000",
+                "timezone": "Europe/London",
+                "timestamp_now": int(time.time())
+            }
+        }
 
 @app.get("/get.php", response_class=PlainTextResponse)
 def get_m3u(username: str, password: str, type: str = "m3u"):
