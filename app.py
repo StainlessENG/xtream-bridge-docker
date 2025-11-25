@@ -1,6 +1,6 @@
 
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse
 import requests
 import time
 from datetime import datetime
@@ -19,73 +19,76 @@ def player_api(username: str, password: str, action: str = None):
     if username != USERNAME or password != PASSWORD:
         return {"user_info": {"auth": 0, "status": "Failed"}}
 
-    response = requests.get(M3U_URL, timeout=30)
-    if response.status_code != 200:
-        return {"error": "Failed to fetch playlist"}
+    # Only fetch playlist if needed
+    if action in ("get_live_categories", "get_live_streams"):
+        response = requests.get(M3U_URL, timeout=30)
+        if response.status_code != 200:
+            return {"error": "Failed to fetch playlist"}
 
-    lines = response.text.splitlines()
-    channels = []
-    categories_map = {}
-    category_counter = 1
+        lines = response.text.splitlines()
+        channels = []
+        categories_map = {}
+        category_counter = 1
 
-    for i in range(len(lines)):
-        if lines[i].startswith("#EXTINF"):
-            name = lines[i].split(",")[-1]
-            match = re.search(r'group-title="([^"]+)"', lines[i])
-            category_name = match.group(1) if match else "Other"
+        for i in range(len(lines)):
+            if lines[i].startswith("#EXTINF"):
+                name = lines[i].split(",")[-1]
+                match = re.search(r'group-title="([^"]+)"', lines[i])
+                category_name = match.group(1) if match else "Other"
 
-            if category_name not in categories_map:
-                categories_map[category_name] = str(category_counter)
-                category_counter += 1
+                if category_name not in categories_map:
+                    categories_map[category_name] = str(category_counter)
+                    category_counter += 1
 
-            category_id = categories_map[category_name]
-            url = lines[i+1].strip() if i+1 < len(lines) else ""
+                category_id = categories_map[category_name]
+                url = lines[i+1].strip() if i+1 < len(lines) else ""
 
-            channels.append({
-                "num": i,
-                "name": name,
-                "stream_type": "live",
-                "stream_id": i,
-                "stream_icon": "",
-                "epg_channel_id": "",
-                "added": str(int(time.time())),
-                "category_id": category_id,
-                "custom_sid": "",
-                "tv_archive": 0,
-                "direct_source": url,
-                "url": f"https://xtream-bridge.onrender.com/live/{USERNAME}/{PASSWORD}/{i}.m3u8"
-            })
+                channels.append({
+                    "num": i,
+                    "name": name,
+                    "stream_type": "live",
+                    "stream_id": i,
+                    "stream_icon": "",
+                    "epg_channel_id": "",
+                    "added": str(int(time.time())),
+                    "category_id": category_id,
+                    "custom_sid": "",
+                    "tv_archive": 0,
+                    "direct_source": url,
+                    "url": f"https://xtream-bridge.onrender.com/live/{USERNAME}/{PASSWORD}/{i}.m3u8"
+                })
 
-    categories = [{"category_id": cid, "category_name": cname, "parent_id": 0}
-                  for cname, cid in categories_map.items()]
+        categories = [{"category_id": cid, "category_name": cname, "parent_id": 0}
+                      for cname, cid in categories_map.items()]
 
-    if action == "get_live_categories":
-        return categories
-    elif action == "get_live_streams":
-        return channels
-    else:
-        return {
-            "user_info": {
-                "username": username,
-                "password": password,
-                "auth": 1,
-                "status": "Active",
-                "exp_date": "0000-00-00 00:00:00",
-                "is_trial": "0",
-                "active_cons": "1",
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "max_connections": "1"
-            },
-            "server_info": {
-                "url": "xtream-bridge.onrender.com",
-                "port": "443",
-                "https": True,
-                "server_protocol": "https",
-                "rtmp_port": "8000",
-                "timezone": "Europe/London",
-                "timestamp_now": int(time.time())
-            }
+        if action == "get_live_categories":
+            return categories
+        elif action == "get_live_streams":
+            return channels
+
+    # Default login response
+    return {
+        "user_info": {
+            "username": username,
+            "password": password,
+            "auth": 1,
+            "status": "Active",
+            "exp_date": "0000-00-00 00:00:00",
+            "is_trial": "0",
+            "active_cons": "1",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "max_connections": "1"
+        },
+        "server_info": {
+            "url": "xtream-bridge.onrender.com",
+            "port": "443",
+            "https": True,
+            "server_protocol": "https",
+            "rtmp_port": "8000",
+            "timezone": "Europe/London",
+            "timestamp_now": int(time.time())
         }
+    }
 
 @app.get("/get.php", response_class=PlainTextResponse)
 def get_m3u(username: str, password: str, type: str = "m3u"):
@@ -112,6 +115,9 @@ def proxy_hls_playlist(username: str, password: str, stream_id: int):
         return PlainTextResponse("Stream Not Found", status_code=404)
 
     stream_url = urls[stream_id]
-    # Proxy the HLS playlist
-    r = requests.get(stream_url)
-    return PlainTextResponse(r.text, media_type="application/vnd.apple.mpegurl")
+    # Fetch the HLS playlist as text
+    r = requests.get(stream_url, timeout=10)
+    if r.status_code == 200:
+        return PlainTextResponse(r.text, media_type="application/vnd.apple.mpegurl")
+    else:
+        return PlainTextResponse(f"Upstream error: {r.status_code}", status_code=502)
