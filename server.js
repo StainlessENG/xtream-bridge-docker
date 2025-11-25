@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
 
 // Your embedded M3U URL
-const M3U_URL = 'https://www.dropbox.com/scl/fi/rhaclvw8dxxqhzculztop/m3u4u-102864-676027-Playlist.m3u?rlkey=mikc84ak8xtfe46xh97pn2fw3&st=abi129rw&dl=1';
+const M3U_URL = 'https://www.dropbox.com/scl/fi/h08dacb55k2aj1ufa3u62/m3u4u-102864-675597-Playlist.m3u?rlkey=0od89zpnmj69nj9fgo4280u9m&st=daeu5phc&dl=1';
 
 // Load users
 const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
