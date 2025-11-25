@@ -1,27 +1,26 @@
 const express = require('express');
-const multer = require('multer');
+const https = require('https');
+const http = require('http');
 const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Your embedded M3U URL
+const M3U_URL = 'https://www.dropbox.com/scl/fi/rhaclvw8dxxqhzculztop/m3u4u-102864-676027-Playlist.m3u?rlkey=mikc84ak8xtfe46xh97pn2fw3&st=abi129rw&dl=1';
+
 // Load users
 const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 
-// Upload config
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-const upload = multer({ dest: uploadDir });
-
-// Channels cache
+// Channels and categories cache
 let channels = [];
+let categories = [];
 
-// CRITICAL: Add these middleware for parsing request bodies
+// Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// CRITICAL: Enable CORS for IPTV apps
+// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -29,79 +28,164 @@ app.use((req, res, next) => {
   next();
 });
 
-// Logging middleware
+// Logging
 app.use((req, res, next) => {
-  console.log(`Incoming request: ${req.method} ${req.url}`);
-  console.log('Query params:', req.query);
-  console.log('Body:', req.body);
+  console.log(`${req.method} ${req.url}`);
   next();
 });
 
-// Serve upload page
-app.get('/upload', (req, res) => {
-  res.sendFile(path.join(__dirname, 'views', 'upload.html'));
-});
+// Helper function to fetch URL content
+function fetchUrl(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? https : http;
+    
+    client.get(url, { 
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    }, (res) => {
+      // Handle redirects
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        console.log(`Redirecting to: ${res.headers.location}`);
+        return fetchUrl(res.headers.location).then(resolve).catch(reject);
+      }
+      
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
+    }).on('error', reject);
+  });
+}
 
-// Handle file upload
-app.post('/upload', upload.single('playlist'), (req, res) => {
-  const filePath = req.file.path;
-  console.log(`File uploaded: ${filePath}`);
-  const content = fs.readFileSync(filePath, 'utf8');
-
+// Helper function to parse M3U content
+function parseM3U(content) {
   if (!content.includes('#EXTM3U')) {
-    return res.status(400).send('Invalid M3U file');
+    throw new Error('Invalid M3U file');
   }
 
-  // Parse M3U manually
-  channels = [];
-  const lines = content.split('\n');
+  const newChannels = [];
+  const newCategories = [];
+  const categoryMap = new Map();
+  let categoryIdCounter = 1;
+  
+  const lines = content.split('\n').map(line => line.trim()).filter(line => line);
+  
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].startsWith('#EXTINF')) {
-      const name = lines[i].split(',')[1] || `Channel ${channels.length + 1}`;
+      const extinf = lines[i];
       const url = lines[i + 1] || '';
-      channels.push({
-        name: name.trim(),
-        stream_id: channels.length + 1,
+      
+      if (!url || url.startsWith('#')) continue;
+      
+      // Extract category
+      let categoryName = 'Uncategorized';
+      let groupMatch = extinf.match(/group-title="([^"]*)"/i);
+      if (!groupMatch) {
+        groupMatch = extinf.match(/group-title=([^\s,]+)/i);
+      }
+      if (!groupMatch) {
+        groupMatch = extinf.match(/tvg-group="([^"]*)"/i);
+      }
+      if (groupMatch && groupMatch[1]) {
+        categoryName = groupMatch[1].trim();
+      }
+      
+      // Get or create category
+      if (!categoryMap.has(categoryName)) {
+        categoryMap.set(categoryName, categoryIdCounter++);
+        newCategories.push({
+          category_id: categoryMap.get(categoryName).toString(),
+          category_name: categoryName,
+          parent_id: 0
+        });
+      }
+      const categoryId = categoryMap.get(categoryName);
+      
+      // Extract channel name
+      const nameParts = extinf.split(',');
+      const channelName = nameParts[nameParts.length - 1].trim() || `Channel ${newChannels.length + 1}`;
+      
+      // Extract other attributes
+      const tvgIdMatch = extinf.match(/tvg-id="([^"]*)"/i);
+      const tvgLogoMatch = extinf.match(/tvg-logo="([^"]*)"/i);
+      
+      newChannels.push({
+        num: newChannels.length + 1,
+        name: channelName,
         stream_type: 'live',
-        stream_url: url.trim()
+        stream_id: newChannels.length + 1,
+        stream_icon: tvgLogoMatch ? tvgLogoMatch[1] : '',
+        epg_channel_id: tvgIdMatch ? tvgIdMatch[1] : null,
+        added: Math.floor(Date.now() / 1000).toString(),
+        category_id: categoryId.toString(),
+        custom_sid: '',
+        tv_archive: 0,
+        direct_source: url.trim(),
+        tv_archive_duration: 0
       });
+      
+      i++;
     }
   }
+  
+  return { channels: newChannels, categories: newCategories };
+}
 
-  console.log(`Loaded ${channels.length} channels from uploaded file`);
-  res.send(`<h2>Upload successful!</h2><p>${channels.length} channels loaded.</p>`);
+// Load M3U on startup
+async function loadM3U() {
+  try {
+    console.log('Fetching M3U from embedded URL...');
+    const content = await fetchUrl(M3U_URL);
+    const result = parseM3U(content);
+    
+    channels = result.channels;
+    categories = result.categories;
+    
+    console.log(`✓ Loaded ${channels.length} channels in ${categories.length} categories`);
+    categories.forEach(cat => {
+      const count = channels.filter(ch => ch.category_id === cat.category_id).length;
+      console.log(`  - ${cat.category_name}: ${count} channels`);
+    });
+  } catch (error) {
+    console.error('Failed to load M3U:', error.message);
+    console.log('Server will start but no channels will be available until M3U is loaded.');
+  }
+}
+
+// Endpoint to manually reload M3U
+app.get('/reload', async (req, res) => {
+  await loadM3U();
+  res.json({
+    success: true,
+    channels: channels.length,
+    categories: categories.length
+  });
 });
 
-// Authentication middleware - checks both query params AND body
+// Authentication middleware
 function authenticate(req, res, next) {
-  // Try query params first, then body
   const username = req.query.username || req.body.username;
   const password = req.query.password || req.body.password;
-  
-  console.log(`Auth attempt - Username: ${username}, Password: ${password}`);
   
   if (users[username] && users[username] === password) {
     req.user = username;
     next();
   } else {
-    console.log('Authentication failed');
     res.status(403).json({ 
-      user_info: {
-        auth: 0,
-        status: 'Disabled',
-        message: 'Invalid credentials'
-      }
+      user_info: { auth: 0, status: 'Disabled', message: 'Invalid credentials' }
     });
   }
 }
 
-// Xtream API: player_api.php - handle different actions
+// Xtream API
 app.get('/player_api.php', authenticate, (req, res) => {
   const action = req.query.action;
+  const categoryId = req.query.category_id;
   
-  console.log(`Action requested: ${action}`);
+  console.log(`Action: ${action}, Category: ${categoryId}`);
 
-  // Default response (login/authentication)
   if (!action) {
     return res.json({
       user_info: {
@@ -109,7 +193,7 @@ app.get('/player_api.php', authenticate, (req, res) => {
         password: users[req.user],
         auth: 1,
         status: 'Active',
-        exp_date: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60), // 1 year from now
+        exp_date: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60),
         is_trial: '0',
         active_cons: '0',
         created_at: Math.floor(Date.now() / 1000),
@@ -121,57 +205,49 @@ app.get('/player_api.php', authenticate, (req, res) => {
         https_port: '443',
         server_protocol: 'http',
         rtmp_port: '1935',
-        time_now: new Date().toISOString()
+        timestamp_now: Math.floor(Date.now() / 1000)
       }
     });
   }
 
-  // Handle get_live_streams
-  if (action === 'get_live_streams') {
-    return res.json(channels);
-  }
-
-  // Handle get_live_categories
   if (action === 'get_live_categories') {
-    return res.json([
-      {
-        category_id: '1',
-        category_name: 'All Channels',
-        parent_id: 0
-      }
-    ]);
+    console.log(`Returning ${categories.length} categories`);
+    return res.json(categories);
   }
 
-  // Handle get_vod_streams
-  if (action === 'get_vod_streams') {
-    return res.json([]);
+  if (action === 'get_live_streams') {
+    let filtered = categoryId ? channels.filter(ch => ch.category_id === categoryId) : channels;
+    console.log(`Returning ${filtered.length} channels`);
+    return res.json(filtered);
   }
 
-  // Handle get_series
-  if (action === 'get_series') {
-    return res.json([]);
-  }
+  if (action === 'get_vod_categories') return res.json([]);
+  if (action === 'get_vod_streams') return res.json([]);
+  if (action === 'get_series_categories') return res.json([]);
+  if (action === 'get_series') return res.json([]);
 
   res.json({ error: 'Unknown action' });
 });
 
-// Also support POST requests for player_api.php
 app.post('/player_api.php', authenticate, (req, res) => {
-  // Redirect to GET handler
   req.query = { ...req.query, ...req.body };
   app._router.handle(req, res);
 });
 
-// Xtream API: get.php (returns M3U)
+// Get M3U file directly
 app.get('/get.php', authenticate, (req, res) => {
-  const m3uContent = channels.map(ch => `#EXTINF:-1,${ch.name}\n${ch.stream_url}`).join('\n');
+  const m3uContent = channels.map(ch => 
+    `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${categories.find(cat => cat.category_id === ch.category_id)?.category_name || 'Uncategorized'}",${ch.name}\n${ch.direct_source}`
+  ).join('\n');
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.send(`#EXTM3U\n${m3uContent}`);
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Upload page: http://localhost:${PORT}/upload`);
+// Start server and load M3U
+app.listen(PORT, async () => {
+  console.log(`Server running on http://localhost:${PORT}`);
   console.log(`API endpoint: http://localhost:${PORT}/player_api.php`);
+  console.log(`Reload M3U: http://localhost:${PORT}/reload`);
+  console.log('');
+  await loadM3U();
 });
