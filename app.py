@@ -1,123 +1,78 @@
 
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
-import requests
-import time
-from datetime import datetime
-import re
+const express = require('express');
+const axios = require('axios');
+const fs = require('fs');
+const M3UParser = require('m3u-parser');
 
-app = FastAPI()
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-M3U_URL = "http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721"
-EPG_URL = "http://m3u4u.com/xml/p87vnr8dzdu4w2q6n41j"
+// Load users
+const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 
-USERNAME = "John"
-PASSWORD = "Sidford2025"
+// Your M3U link
+const M3U_URL = 'http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721it';
 
-@app.get("/player_api.php")
-def player_api(username: str, password: str, action: str = None):
-    if username != USERNAME or password != PASSWORD:
-        return {"user_info": {"auth": 0, "status": "Failed"}}
+// Cache for channels
+let channels = [];
 
-    # Only fetch playlist if needed
-    if action in ("get_live_categories", "get_live_streams"):
-        response = requests.get(M3U_URL, timeout=30)
-        if response.status_code != 200:
-            return {"error": "Failed to fetch playlist"}
+// Fetch and parse M3U
+async function loadPlaylist() {
+  try {
+    const response = await axios.get(M3U_URL);
+    const parser = new M3UParser();
+    parser.read(response.data);
+    channels = parser.getItems().map((item, index) => ({
+      name: item.name,
+      stream_id: index + 1,
+      stream_type: 'live',
+      stream_url: item.url
+    }));
+    console.log(`Loaded ${channels.length} channels`);
+  } catch (error) {
+    console.error('Error loading playlist:', error.message);
+  }
+}
 
-        lines = response.text.splitlines()
-        channels = []
-        categories_map = {}
-        category_counter = 1
+// Authentication middleware
+function authenticate(req, res, next) {
+  const { username, password } = req.query;
+  if (users[username] && users[username] === password) {
+    req.user = username;
+    next();
+  } else {
+    res.status(403).json({ error: 'Invalid credentials' });
+  }
+}
 
-        for i in range(len(lines)):
-            if lines[i].startswith("#EXTINF"):
-                name = lines[i].split(",")[-1]
-                match = re.search(r'group-title="([^"]+)"', lines[i])
-                category_name = match.group(1) if match else "Other"
+// Xtream API: player_api.php
+app.get('/player_api.php', authenticate, (req, res) => {
+  res.json({
+    user_info: {
+      username: req.user,
+      password: users[req.user],
+      auth: 1,
+      status: 'Active'
+    },
+    server_info: {
+      url: req.hostname,
+      port: PORT,
+      https_port: 443,
+      server_protocol: 'http'
+    },
+    available_channels: channels
+  });
+});
 
-                if category_name not in categories_map:
-                    categories_map[category_name] = str(category_counter)
-                    category_counter += 1
+// Xtream API: get.php (returns M3U)
+app.get('/get.php', authenticate, (req, res) => {
+  const m3uContent = channels.map(ch => `#EXTINF:-1,${ch.name}\n${ch.stream_url}`).join('\n');
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.send(`#EXTM3U\n${m3uContent}`);
+});
 
-                category_id = categories_map[category_name]
-                url = lines[i+1].strip() if i+1 < len(lines) else ""
-
-                channels.append({
-                    "num": i,
-                    "name": name,
-                    "stream_type": "live",
-                    "stream_id": i,
-                    "stream_icon": "",
-                    "epg_channel_id": "",
-                    "added": str(int(time.time())),
-                    "category_id": category_id,
-                    "custom_sid": "",
-                    "tv_archive": 0,
-                    "direct_source": url,
-                    "url": f"https://xtream-bridge.onrender.com/live/{USERNAME}/{PASSWORD}/{i}.m3u8"
-                })
-
-        categories = [{"category_id": cid, "category_name": cname, "parent_id": 0}
-                      for cname, cid in categories_map.items()]
-
-        if action == "get_live_categories":
-            return categories
-        elif action == "get_live_streams":
-            return channels
-
-    # Default login response
-    return {
-        "user_info": {
-            "username": username,
-            "password": password,
-            "auth": 1,
-            "status": "Active",
-            "exp_date": "0000-00-00 00:00:00",
-            "is_trial": "0",
-            "active_cons": "1",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "max_connections": "1"
-        },
-        "server_info": {
-            "url": "xtream-bridge.onrender.com",
-            "port": "443",
-            "https": True,
-            "server_protocol": "https",
-            "rtmp_port": "8000",
-            "timezone": "Europe/London",
-            "timestamp_now": int(time.time())
-        }
-    }
-
-@app.get("/get.php", response_class=PlainTextResponse)
-def get_m3u(username: str, password: str, type: str = "m3u"):
-    if username != USERNAME or password != PASSWORD:
-        return "#EXTM3U\n# Authentication Failed"
-    return requests.get(M3U_URL).text
-
-@app.get("/xmltv.php", response_class=PlainTextResponse)
-def get_epg(username: str, password: str):
-    if username != USERNAME or password != PASSWORD:
-        return "<xmltv></xmltv>"
-    return requests.get(EPG_URL).text
-
-@app.get("/live/{username}/{password}/{stream_id}.m3u8")
-def proxy_hls_playlist(username: str, password: str, stream_id: int):
-    if username != USERNAME or password != PASSWORD:
-        return PlainTextResponse("Authentication Failed", status_code=403)
-
-    response = requests.get(M3U_URL, timeout=30)
-    lines = response.text.splitlines()
-    urls = [lines[i+1].strip() for i in range(len(lines)) if lines[i].startswith("#EXTINF")]
-
-    if stream_id >= len(urls):
-        return PlainTextResponse("Stream Not Found", status_code=404)
-
-    stream_url = urls[stream_id]
-    # Fetch the HLS playlist as text
-    r = requests.get(stream_url, timeout=10)
-    if r.status_code == 200:
-        return PlainTextResponse(r.text, media_type="application/vnd.apple.mpegurl")
-    else:
-        return PlainTextResponse(f"Upstream error: {r.status_code}", status_code=502)
+// Start server and load playlist
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  await loadPlaylist();
+});
