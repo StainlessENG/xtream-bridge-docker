@@ -2,6 +2,7 @@ const express = require('express');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const { URL } = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -111,11 +112,13 @@ function parseM3U(content) {
       const tvgIdMatch = extinf.match(/tvg-id="([^"]*)"/i);
       const tvgLogoMatch = extinf.match(/tvg-logo="([^"]*)"/i);
       
+      const streamId = newChannels.length + 1;
+      
       newChannels.push({
-        num: newChannels.length + 1,
+        num: streamId,
         name: channelName,
         stream_type: 'live',
-        stream_id: newChannels.length + 1,
+        stream_id: streamId,
         stream_icon: tvgLogoMatch ? tvgLogoMatch[1] : '',
         epg_channel_id: tvgIdMatch ? tvgIdMatch[1] : null,
         added: Math.floor(Date.now() / 1000).toString(),
@@ -178,6 +181,64 @@ function authenticate(req, res, next) {
     });
   }
 }
+
+// CRITICAL: Stream proxy endpoint for live streams
+// Format: /live/{username}/{password}/{stream_id}.m3u8
+app.get('/live/:username/:password/:stream_id', (req, res) => {
+  const { username, password, stream_id } = req.params;
+  
+  // Authenticate
+  if (!users[username] || users[username] !== password) {
+    return res.status(403).send('Invalid credentials');
+  }
+  
+  // Extract numeric stream ID (remove .m3u8 or .ts extension)
+  const cleanStreamId = parseInt(stream_id.replace(/\.(m3u8|ts)$/, ''));
+  
+  console.log(`Stream request: ${username} -> Stream ID: ${cleanStreamId}`);
+  
+  // Find channel
+  const channel = channels.find(ch => ch.stream_id === cleanStreamId);
+  
+  if (!channel) {
+    console.log(`Channel not found: ${cleanStreamId}`);
+    return res.status(404).send('Channel not found');
+  }
+  
+  console.log(`Proxying stream: ${channel.name} -> ${channel.direct_source}`);
+  
+  // Proxy the stream
+  const streamUrl = channel.direct_source;
+  const client = streamUrl.startsWith('https') ? https : http;
+  
+  const proxyReq = client.get(streamUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': streamUrl
+    }
+  }, (proxyRes) => {
+    // Forward status code and headers
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    
+    // Pipe the stream
+    proxyRes.pipe(res);
+    
+    proxyRes.on('error', (err) => {
+      console.error(`Stream error for ${channel.name}:`, err.message);
+      res.end();
+    });
+  });
+  
+  proxyReq.on('error', (err) => {
+    console.error(`Proxy error for ${channel.name}:`, err.message);
+    res.status(500).send('Stream error');
+  });
+  
+  // Handle client disconnect
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+});
 
 // Xtream API
 app.get('/player_api.php', authenticate, (req, res) => {
@@ -247,6 +308,7 @@ app.get('/get.php', authenticate, (req, res) => {
 app.listen(PORT, async () => {
   console.log(`Server running on http://localhost:${PORT}`);
   console.log(`API endpoint: http://localhost:${PORT}/player_api.php`);
+  console.log(`Stream format: http://localhost:${PORT}/live/{username}/{password}/{stream_id}.m3u8`);
   console.log(`Reload M3U: http://localhost:${PORT}/reload`);
   console.log('');
   await loadM3U();
