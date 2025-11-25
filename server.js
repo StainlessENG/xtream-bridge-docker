@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 
 // Your M3U link
-const M3U_URL = 'http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721it';
+const M3U_URL = 'http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721';
 
 // Cache for channels
 let channels = [];
