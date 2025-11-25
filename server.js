@@ -12,6 +12,9 @@ const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com
 // Your embedded M3U URL
 const M3U_URL = 'https://www.dropbox.com/scl/fi/go509m79v58q86rhmyii4/m3u4u-102864-670937-Playlist.m3u?rlkey=hz4r443sknsa17oqhr4jzk33j&st=pkbymt55&dl=1';
 
+// Your EPG URL
+const EPG_URL = 'https://www.dropbox.com/scl/fi/wmt9vxra8pc3t7arprpz5/m3u4u-102864-674859-EPG.xml?rlkey=yfti8u9yqmn1e7z4ed9nnjoxl&st=w312omu0&dl=1';
+
 // Load users
 const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 console.log('Loaded users:', Object.keys(users));
@@ -19,6 +22,11 @@ console.log('Loaded users:', Object.keys(users));
 // Channels and categories cache
 let channels = [];
 let categories = [];
+
+// EPG cache
+let cachedEPG = null;
+let epgLastFetched = 0;
+const EPG_CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
 
 // Middleware
 app.use(express.json());
@@ -169,6 +177,7 @@ app.get('/', (req, res) => {
     <p>Channels: ${channels.length}</p>
     <p>Categories: ${categories.length}</p>
     <p>Users: ${Object.keys(users).join(', ')}</p>
+    <p>EPG: ${cachedEPG ? 'Loaded' : 'Not loaded'}</p>
     <p><a href="/reload">Reload M3U</a></p>
   `);
 });
@@ -272,7 +281,7 @@ app.get('/player_api.php', authenticate, (req, res) => {
         message: '',
         auth: 1,
         status: 'Active',
-        exp_date: '1767225600',  // Fixed date far in future
+        exp_date: '1767225600',
         is_trial: '0',
         active_cons: '0',
         created_at: '1640995200',
@@ -294,7 +303,7 @@ app.get('/player_api.php', authenticate, (req, res) => {
       }
     };
     
-    console.log('✓ Sending login response:', JSON.stringify(response, null, 2));
+    console.log('✓ Sending login response');
     return res.json(response);
   }
 
@@ -338,11 +347,36 @@ app.get('/get.php', authenticate, (req, res) => {
   res.send(`#EXTM3U\n${m3uContent}`);
 });
 
-// EPG endpoint (stub)
-app.get('/xmltv.php', authenticate, (req, res) => {
-  console.log('EPG requested (returning empty)');
-  res.setHeader('Content-Type', 'application/xml');
-  res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
+// EPG endpoint - fetch from Dropbox
+app.get('/xmltv.php', authenticate, async (req, res) => {
+  console.log('📺 EPG requested');
+  
+  try {
+    // Check if we have cached EPG that's still fresh
+    const now = Date.now();
+    if (cachedEPG && (now - epgLastFetched) < EPG_CACHE_DURATION) {
+      console.log('✓ Returning cached EPG');
+      res.setHeader('Content-Type', 'application/xml');
+      return res.send(cachedEPG);
+    }
+    
+    // Fetch fresh EPG
+    console.log('Fetching fresh EPG from Dropbox...');
+    const epgData = await fetchUrl(EPG_URL);
+    
+    // Cache it
+    cachedEPG = epgData;
+    epgLastFetched = now;
+    
+    console.log(`✓ EPG loaded (${(epgData.length / 1024).toFixed(0)} KB)`);
+    res.setHeader('Content-Type', 'application/xml');
+    res.send(epgData);
+  } catch (error) {
+    console.error('❌ EPG fetch failed:', error.message);
+    // Return empty EPG on error so it doesn't break the app
+    res.setHeader('Content-Type', 'application/xml');
+    res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
+  }
 });
 
 // Start server and load M3U
