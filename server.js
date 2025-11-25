@@ -3,7 +3,6 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const M3UParser = require('m3u-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -35,17 +34,27 @@ app.post('/upload', upload.single('playlist'), (req, res) => {
   const filePath = req.file.path;
   console.log(`File uploaded: ${filePath}`);
   const content = fs.readFileSync(filePath, 'utf8');
+
   if (!content.includes('#EXTM3U')) {
     return res.status(400).send('Invalid M3U file');
   }
-  const parser = new M3UParser();
-  parser.read(content);
-  channels = parser.getItems().map((item, index) => ({
-    name: item.name,
-    stream_id: index + 1,
-    stream_type: 'live',
-    stream_url: item.url
-  }));
+
+  // Parse M3U manually
+  channels = [];
+  const lines = content.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXTINF')) {
+      const name = lines[i].split(',')[1] || `Channel ${channels.length + 1}`;
+      const url = lines[i + 1] || '';
+      channels.push({
+        name: name.trim(),
+        stream_id: channels.length + 1,
+        stream_type: 'live',
+        stream_url: url.trim()
+      });
+    }
+  }
+
   console.log(`Loaded ${channels.length} channels from uploaded file`);
   res.send(`<h2>Upload successful!</h2><p>${channels.length} channels loaded.</p>`);
 });
