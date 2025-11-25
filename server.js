@@ -1,7 +1,8 @@
 
 const express = require('express');
-const axios = require('axios');
+const multer = require('multer');
 const fs = require('fs');
+const path = require('path');
 const M3UParser = require('m3u-parser');
 
 const app = express();
@@ -10,29 +11,44 @@ const PORT = process.env.PORT || 3000;
 // Load users
 const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 
-// Your M3U link
-const M3U_URL = 'http://m3u4u.com/m3u/jwmzn1w282ukvxw4n721';
+// Upload config
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+const upload = multer({ dest: uploadDir });
 
-// Cache for channels
+// Channels cache
 let channels = [];
 
-// Fetch and parse M3U
-async function loadPlaylist() {
-  try {
-    const response = await axios.get(M3U_URL);
-    const parser = new M3UParser();
-    parser.read(response.data);
-    channels = parser.getItems().map((item, index) => ({
-      name: item.name,
-      stream_id: index + 1,
-      stream_type: 'live',
-      stream_url: item.url
-    }));
-    console.log(`Loaded ${channels.length} channels`);
-  } catch (error) {
-    console.error('Error loading playlist:', error.message);
+// Logging middleware
+app.use((req, res, next) => {
+  console.log(`Incoming request: ${req.method} ${req.url}`);
+  next();
+});
+
+// Serve upload page
+app.get('/upload', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'upload.html'));
+});
+
+// Handle file upload
+app.post('/upload', upload.single('playlist'), (req, res) => {
+  const filePath = req.file.path;
+  console.log(`File uploaded: ${filePath}`);
+  const content = fs.readFileSync(filePath, 'utf8');
+  if (!content.includes('#EXTM3U')) {
+    return res.status(400).send('Invalid M3U file');
   }
-}
+  const parser = new M3UParser();
+  parser.read(content);
+  channels = parser.getItems().map((item, index) => ({
+    name: item.name,
+    stream_id: index + 1,
+    stream_type: 'live',
+    stream_url: item.url
+  }));
+  console.log(`Loaded ${channels.length} channels from uploaded file`);
+  res.send(`<h2>Upload successful!</h2><p>${channels.length} channels loaded.</p>`);
+});
 
 // Authentication middleware
 function authenticate(req, res, next) {
@@ -71,8 +87,7 @@ app.get('/get.php', authenticate, (req, res) => {
   res.send(`#EXTM3U\n${m3uContent}`);
 });
 
-// Start server and load playlist
-app.listen(PORT, async () => {
+// Start server
+app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  await loadPlaylist();
 });
