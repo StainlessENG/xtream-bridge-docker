@@ -53,7 +53,7 @@ def player_api(username: str, password: str, action: str = None):
                 "custom_sid": "",
                 "tv_archive": 0,
                 "direct_source": url,
-                "url": f"https://xtream-bridge.onrender.com/live/{USERNAME}/{PASSWORD}/{i}.ts"
+                "url": f"https://xtream-bridge.onrender.com/live/{USERNAME}/{PASSWORD}/{i}.m3u8"
             })
 
     categories = [{"category_id": cid, "category_name": cname, "parent_id": 0}
@@ -99,8 +99,8 @@ def get_epg(username: str, password: str):
         return "<xmltv></xmltv>"
     return requests.get(EPG_URL).text
 
-@app.get("/live/{username}/{password}/{stream_id}.ts")
-def proxy_stream(username: str, password: str, stream_id: int):
+@app.get("/live/{username}/{password}/{stream_id}.m3u8")
+def proxy_hls_playlist(username: str, password: str, stream_id: int):
     if username != USERNAME or password != PASSWORD:
         return PlainTextResponse("Authentication Failed", status_code=403)
 
@@ -112,5 +112,6 @@ def proxy_stream(username: str, password: str, stream_id: int):
         return PlainTextResponse("Stream Not Found", status_code=404)
 
     stream_url = urls[stream_id]
-    r = requests.get(stream_url, stream=True)
-    return StreamingResponse(r.iter_content(chunk_size=1024), media_type="video/MP2T")
+    # Proxy the HLS playlist
+    r = requests.get(stream_url)
+    return PlainTextResponse(r.text, media_type="application/vnd.apple.mpegurl")
