@@ -1,7 +1,16 @@
 
-"dependencies": {
-  "axios": "^1.6.0",
-  "express": "^4.18.2",
-  "m3u-parser": "^1.0.2",
-  "multer": "^1.4.5-lts.1"
+{
+  "name": "iptv-portal",
+  "version": "1.0.0",
+  "description": "IPTV Xtream API portal with upload feature",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "express": "^4.18.2",
+    "m3u-parser": "^1.0.2",
+    "multer": "^1.4.5-lts.1"
+  }
 }
