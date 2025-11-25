@@ -9,23 +9,16 @@ const PORT = process.env.PORT || 3000;
 // IMPORTANT: Set your public URL here
 const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
 
-// Your embedded M3U URL
-const M3U_URL = 'https://www.dropbox.com/scl/fi/go509m79v58q86rhmyii4/m3u4u-102864-670937-Playlist.m3u?rlkey=hz4r443sknsa17oqhr4jzk33j&st=pkbymt55&dl=1';
-
-// Your EPG URL
-const EPG_URL = 'https://www.dropbox.com/scl/fi/wmt9vxra8pc3t7arprpz5/m3u4u-102864-674859-EPG.xml?rlkey=yfti8u9yqmn1e7z4ed9nnjoxl&st=w312omu0&dl=1';
-
-// Load users
+// Load users with their individual M3U and EPG URLs
 const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 console.log('Loaded users:', Object.keys(users));
 
-// Channels and categories cache
-let channels = [];
-let categories = [];
+// Per-user channels and categories cache
+const userChannels = {}; // username -> channels array
+const userCategories = {}; // username -> categories array
 
-// EPG cache
-let cachedEPG = null;
-let epgLastFetched = 0;
+// Per-user EPG cache
+const userEPG = {}; // username -> { data, lastFetched }
 const EPG_CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
 
 // Middleware
@@ -144,42 +137,67 @@ function parseM3U(content) {
   return { channels: newChannels, categories: newCategories };
 }
 
-// Load M3U on startup
-async function loadM3U() {
+// Load M3U for a specific user
+async function loadUserM3U(username) {
   try {
-    console.log('Fetching M3U from embedded URL...');
-    const content = await fetchUrl(M3U_URL);
+    const userConfig = users[username];
+    if (!userConfig || !userConfig.m3u_url) {
+      console.log(`No M3U URL configured for user: ${username}`);
+      return;
+    }
+
+    console.log(`Fetching M3U for user: ${username}`);
+    const content = await fetchUrl(userConfig.m3u_url);
     const result = parseM3U(content);
     
-    channels = result.channels;
-    categories = result.categories;
+    userChannels[username] = result.channels;
+    userCategories[username] = result.categories;
     
-    console.log(`✓ Loaded ${channels.length} channels in ${categories.length} categories`);
+    console.log(`✓ Loaded ${result.channels.length} channels in ${result.categories.length} categories for ${username}`);
   } catch (error) {
-    console.error('Failed to load M3U:', error.message);
+    console.error(`Failed to load M3U for ${username}:`, error.message);
+    userChannels[username] = [];
+    userCategories[username] = [];
   }
 }
 
-// Endpoint to manually reload M3U
-app.get('/reload', async (req, res) => {
-  await loadM3U();
-  res.json({
-    success: true,
-    channels: channels.length,
-    categories: categories.length
-  });
-});
+// Load all users' M3U files on startup
+async function loadAllUsers() {
+  console.log('Loading M3U files for all users...');
+  for (const username of Object.keys(users)) {
+    await loadUserM3U(username);
+  }
+  console.log('All users loaded!');
+}
 
 // Root endpoint
 app.get('/', (req, res) => {
+  const userStats = Object.keys(users).map(u => 
+    `${u}: ${userChannels[u]?.length || 0} channels, ${userCategories[u]?.length || 0} categories`
+  ).join('<br>');
+  
   res.send(`
     <h1>Xtream Bridge Server</h1>
-    <p>Channels: ${channels.length}</p>
-    <p>Categories: ${categories.length}</p>
-    <p>Users: ${Object.keys(users).join(', ')}</p>
-    <p>EPG: ${cachedEPG ? 'Loaded' : 'Not loaded'}</p>
-    <p><a href="/reload">Reload M3U</a></p>
+    <h2>Users:</h2>
+    <p>${userStats}</p>
+    <p><a href="/reload-all">Reload All Users</a></p>
   `);
+});
+
+// Reload all users
+app.get('/reload-all', async (req, res) => {
+  await loadAllUsers();
+  res.send('<h2>All users reloaded!</h2><a href="/">Back</a>');
+});
+
+// Reload specific user
+app.get('/reload/:username', async (req, res) => {
+  const username = req.params.username;
+  if (!users[username]) {
+    return res.status(404).send('User not found');
+  }
+  await loadUserM3U(username);
+  res.send(`<h2>User ${username} reloaded!</h2><a href="/">Back</a>`);
 });
 
 // Authentication middleware - CASE INSENSITIVE
@@ -187,17 +205,29 @@ function authenticate(req, res, next) {
   const username = (req.query.username || req.body.username || '').toLowerCase();
   const password = req.query.password || req.body.password;
   
-  console.log(`🔐 Auth attempt: username="${username}", password="${password ? '***' : 'MISSING'}"`);
+  console.log(`🔐 Auth attempt: username="${username}"`);
   
   // Find user case-insensitively
   const actualUsername = Object.keys(users).find(u => u.toLowerCase() === username);
   
-  if (actualUsername && users[actualUsername] === password) {
+  if (actualUsername && users[actualUsername].password === password) {
     console.log(`✓ Auth success for: ${actualUsername}`);
     req.user = actualUsername;
-    next();
+    
+    // Load user's M3U if not already loaded
+    if (!userChannels[actualUsername]) {
+      console.log(`First login for ${actualUsername}, loading M3U...`);
+      loadUserM3U(actualUsername).then(() => {
+        next();
+      }).catch(err => {
+        console.error(`Failed to load M3U for ${actualUsername}:`, err);
+        next();
+      });
+    } else {
+      next();
+    }
   } else {
-    console.log(`❌ Auth failed. Available users: ${Object.keys(users).join(', ')}`);
+    console.log(`❌ Auth failed`);
     return res.status(403).json({ 
       user_info: { 
         auth: 0, 
@@ -216,7 +246,7 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   // Case-insensitive auth for streams
   const actualUsername = Object.keys(users).find(u => u.toLowerCase() === usernameLower);
   
-  if (!actualUsername || users[actualUsername] !== password) {
+  if (!actualUsername || users[actualUsername].password !== password) {
     console.log('❌ Stream auth failed');
     return res.status(403).send('Invalid credentials');
   }
@@ -225,6 +255,7 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   
   console.log(`🎬 Stream request: User=${actualUsername}, StreamID=${cleanStreamId}`);
   
+  const channels = userChannels[actualUsername] || [];
   const channel = channels.find(ch => ch.stream_id === cleanStreamId);
   
   if (!channel) {
@@ -233,7 +264,6 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   }
   
   console.log(`✓ Proxying: ${channel.name}`);
-  console.log(`  Source: ${channel.direct_source}`);
   
   const streamUrl = channel.direct_source;
   const client = streamUrl.startsWith('https') ? https : http;
@@ -244,7 +274,6 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
       'Referer': streamUrl
     }
   }, (proxyRes) => {
-    console.log(`  Response: ${proxyRes.statusCode}`);
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
     
@@ -265,19 +294,22 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   });
 });
 
-// Xtream API - CRITICAL: This is what IPTV Smarters checks on login
+// Xtream API
 app.get('/player_api.php', authenticate, (req, res) => {
   const action = req.query.action;
   const categoryId = req.query.category_id;
   
-  console.log(`📡 API Call: action="${action}", category="${categoryId}", user="${req.user}"`);
+  console.log(`📡 API Call: action="${action}", user="${req.user}"`);
 
-  // CRITICAL: Default response when no action (this is the login check)
+  const channels = userChannels[req.user] || [];
+  const categories = userCategories[req.user] || [];
+
+  // Default response (login check)
   if (!action) {
     const response = {
       user_info: {
         username: req.user,
-        password: users[req.user],
+        password: users[req.user].password,
         message: '',
         auth: 1,
         status: 'Active',
@@ -303,18 +335,18 @@ app.get('/player_api.php', authenticate, (req, res) => {
       }
     };
     
-    console.log('✓ Sending login response');
+    console.log(`✓ Sending login response for ${req.user}`);
     return res.json(response);
   }
 
   if (action === 'get_live_categories') {
-    console.log(`✓ Returning ${categories.length} categories`);
+    console.log(`✓ Returning ${categories.length} categories for ${req.user}`);
     return res.json(categories);
   }
 
   if (action === 'get_live_streams') {
     let filtered = categoryId ? channels.filter(ch => ch.category_id === categoryId) : channels;
-    console.log(`✓ Returning ${filtered.length} channels`);
+    console.log(`✓ Returning ${filtered.length} channels for ${req.user}`);
     return res.json(filtered);
   }
 
@@ -323,7 +355,6 @@ app.get('/player_api.php', authenticate, (req, res) => {
   if (action === 'get_series_categories') return res.json([]);
   if (action === 'get_series') return res.json([]);
 
-  console.log(`❓ Unknown action: ${action}`);
   res.json({ error: 'Unknown action' });
 });
 
@@ -337,6 +368,9 @@ app.get('/get.php', authenticate, (req, res) => {
   const username = req.query.username || req.body.username;
   const password = req.query.password || req.body.password;
   
+  const channels = userChannels[req.user] || [];
+  const categories = userCategories[req.user] || [];
+  
   const m3uContent = channels.map(ch => {
     const proxyUrl = `${SERVER_URL}/live/${username}/${password}/${ch.stream_id}.m3u8`;
     const cat = categories.find(cat => cat.category_id === ch.category_id);
@@ -347,42 +381,52 @@ app.get('/get.php', authenticate, (req, res) => {
   res.send(`#EXTM3U\n${m3uContent}`);
 });
 
-// EPG endpoint - fetch from Dropbox
+// EPG endpoint - per user
 app.get('/xmltv.php', authenticate, async (req, res) => {
-  console.log('📺 EPG requested');
+  console.log(`📺 EPG requested for ${req.user}`);
   
   try {
+    const userConfig = users[req.user];
+    if (!userConfig || !userConfig.epg_url) {
+      console.log(`No EPG URL configured for ${req.user}`);
+      res.setHeader('Content-Type', 'application/xml');
+      return res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
+    }
+
     // Check if we have cached EPG that's still fresh
     const now = Date.now();
-    if (cachedEPG && (now - epgLastFetched) < EPG_CACHE_DURATION) {
-      console.log('✓ Returning cached EPG');
+    const cached = userEPG[req.user];
+    
+    if (cached && (now - cached.lastFetched) < EPG_CACHE_DURATION) {
+      console.log(`✓ Returning cached EPG for ${req.user}`);
       res.setHeader('Content-Type', 'application/xml');
-      return res.send(cachedEPG);
+      return res.send(cached.data);
     }
     
     // Fetch fresh EPG
-    console.log('Fetching fresh EPG from Dropbox...');
-    const epgData = await fetchUrl(EPG_URL);
+    console.log(`Fetching fresh EPG for ${req.user}...`);
+    const epgData = await fetchUrl(userConfig.epg_url);
     
     // Cache it
-    cachedEPG = epgData;
-    epgLastFetched = now;
+    userEPG[req.user] = {
+      data: epgData,
+      lastFetched: now
+    };
     
-    console.log(`✓ EPG loaded (${(epgData.length / 1024).toFixed(0)} KB)`);
+    console.log(`✓ EPG loaded for ${req.user} (${(epgData.length / 1024).toFixed(0)} KB)`);
     res.setHeader('Content-Type', 'application/xml');
     res.send(epgData);
   } catch (error) {
-    console.error('❌ EPG fetch failed:', error.message);
-    // Return empty EPG on error so it doesn't break the app
+    console.error(`❌ EPG fetch failed for ${req.user}:`, error.message);
     res.setHeader('Content-Type', 'application/xml');
     res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
   }
 });
 
-// Start server and load M3U
+// Start server and load all users
 app.listen(PORT, async () => {
   console.log(`Server running on ${SERVER_URL}`);
   console.log(`API endpoint: ${SERVER_URL}/player_api.php`);
   console.log('');
-  await loadM3U();
+  await loadAllUsers();
 });
