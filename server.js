@@ -7,6 +7,9 @@ const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// IMPORTANT: Set your public URL here (use your Render URL)
+const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
+
 // Your embedded M3U URL
 const M3U_URL = 'https://www.dropbox.com/scl/fi/rhaclvw8dxxqhzculztop/m3u4u-102864-676027-Playlist.m3u?rlkey=mikc84ak8xtfe46xh97pn2fw3&st=abi129rw&dl=1';
 
@@ -167,6 +170,16 @@ app.get('/reload', async (req, res) => {
   });
 });
 
+// Root endpoint
+app.get('/', (req, res) => {
+  res.send(`
+    <h1>Xtream Bridge Server</h1>
+    <p>Channels: ${channels.length}</p>
+    <p>Categories: ${categories.length}</p>
+    <p><a href="/reload">Reload M3U</a></p>
+  `);
+});
+
 // Authentication middleware
 function authenticate(req, res, next) {
   const username = req.query.username || req.body.username;
@@ -182,30 +195,31 @@ function authenticate(req, res, next) {
   }
 }
 
-// CRITICAL: Stream proxy endpoint for live streams
-// Format: /live/{username}/{password}/{stream_id}.m3u8
+// Stream proxy endpoint - handles both .m3u8 and .ts requests
 app.get('/live/:username/:password/:stream_id', (req, res) => {
   const { username, password, stream_id } = req.params;
   
   // Authenticate
   if (!users[username] || users[username] !== password) {
+    console.log('Stream auth failed');
     return res.status(403).send('Invalid credentials');
   }
   
-  // Extract numeric stream ID (remove .m3u8 or .ts extension)
+  // Extract numeric stream ID
   const cleanStreamId = parseInt(stream_id.replace(/\.(m3u8|ts)$/, ''));
   
-  console.log(`Stream request: ${username} -> Stream ID: ${cleanStreamId}`);
+  console.log(`🎬 Stream request: User=${username}, StreamID=${cleanStreamId}`);
   
   // Find channel
   const channel = channels.find(ch => ch.stream_id === cleanStreamId);
   
   if (!channel) {
-    console.log(`Channel not found: ${cleanStreamId}`);
+    console.log(`❌ Channel not found: ${cleanStreamId}`);
     return res.status(404).send('Channel not found');
   }
   
-  console.log(`Proxying stream: ${channel.name} -> ${channel.direct_source}`);
+  console.log(`✓ Proxying: ${channel.name}`);
+  console.log(`  Source: ${channel.direct_source}`);
   
   // Proxy the stream
   const streamUrl = channel.direct_source;
@@ -217,6 +231,8 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
       'Referer': streamUrl
     }
   }, (proxyRes) => {
+    console.log(`  Response: ${proxyRes.statusCode}`);
+    
     // Forward status code and headers
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     
@@ -224,14 +240,15 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
     proxyRes.pipe(res);
     
     proxyRes.on('error', (err) => {
-      console.error(`Stream error for ${channel.name}:`, err.message);
-      res.end();
+      console.error(`❌ Stream error for ${channel.name}:`, err.message);
     });
   });
   
   proxyReq.on('error', (err) => {
-    console.error(`Proxy error for ${channel.name}:`, err.message);
-    res.status(500).send('Stream error');
+    console.error(`❌ Proxy error for ${channel.name}:`, err.message);
+    if (!res.headersSent) {
+      res.status(500).send('Stream error');
+    }
   });
   
   // Handle client disconnect
@@ -248,6 +265,7 @@ app.get('/player_api.php', authenticate, (req, res) => {
   console.log(`Action: ${action}, Category: ${categoryId}`);
 
   if (!action) {
+    const serverUrl = SERVER_URL || `http://${req.hostname}:${PORT}`;
     return res.json({
       user_info: {
         username: req.user,
@@ -261,10 +279,10 @@ app.get('/player_api.php', authenticate, (req, res) => {
         max_connections: '1'
       },
       server_info: {
-        url: req.hostname,
+        url: serverUrl,
         port: PORT.toString(),
         https_port: '443',
-        server_protocol: 'http',
+        server_protocol: serverUrl.startsWith('https') ? 'https' : 'http',
         rtmp_port: '1935',
         timestamp_now: Math.floor(Date.now() / 1000)
       }
@@ -295,21 +313,34 @@ app.post('/player_api.php', authenticate, (req, res) => {
   app._router.handle(req, res);
 });
 
-// Get M3U file directly
+// Get M3U file with proxied URLs
 app.get('/get.php', authenticate, (req, res) => {
-  const m3uContent = channels.map(ch => 
-    `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${categories.find(cat => cat.category_id === ch.category_id)?.category_name || 'Uncategorized'}",${ch.name}\n${ch.direct_source}`
-  ).join('\n');
+  const serverUrl = SERVER_URL || `http://${req.hostname}:${PORT}`;
+  const username = req.query.username || req.body.username;
+  const password = req.query.password || req.body.password;
+  
+  const m3uContent = channels.map(ch => {
+    const proxyUrl = `${serverUrl}/live/${username}/${password}/${ch.stream_id}.m3u8`;
+    return `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${categories.find(cat => cat.category_id === ch.category_id)?.category_name || 'Uncategorized'}",${ch.name}\n${proxyUrl}`;
+  }).join('\n');
+  
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.send(`#EXTM3U\n${m3uContent}`);
 });
 
+// EPG endpoint (stub)
+app.get('/xmltv.php', authenticate, (req, res) => {
+  console.log('EPG requested (returning empty)');
+  res.setHeader('Content-Type', 'application/xml');
+  res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
+});
+
 // Start server and load M3U
 app.listen(PORT, async () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`API endpoint: http://localhost:${PORT}/player_api.php`);
-  console.log(`Stream format: http://localhost:${PORT}/live/{username}/{password}/{stream_id}.m3u8`);
-  console.log(`Reload M3U: http://localhost:${PORT}/reload`);
+  console.log(`Server running on ${SERVER_URL || `http://localhost:${PORT}`}`);
+  console.log(`API endpoint: ${SERVER_URL || `http://localhost:${PORT}`}/player_api.php`);
+  console.log(`Stream format: /live/{username}/{password}/{stream_id}.m3u8`);
+  console.log(`Reload M3U: ${SERVER_URL || `http://localhost:${PORT}`}/reload`);
   console.log('');
   await loadM3U();
 });
