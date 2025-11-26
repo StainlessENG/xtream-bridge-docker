@@ -36,42 +36,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Enhanced logging middleware with better formatting
+// Logging
 app.use((req, res, next) => {
-  const method = req.method;
-  const url = req.url;
-  
-  // Ignore health checks and favicon
-  if (method === 'HEAD' || url === '/favicon.ico') {
-    return next();
-  }
-  
-  // Timestamp
-  const timestamp = new Date().toISOString().substring(11, 19); // HH:MM:SS
-  
-  if (url.includes('/player_api.php')) {
-    const action = req.query.action || 'login';
-    const user = req.query.username || '?';
-    console.log(`[${timestamp}] 📡 API: ${user} -> ${action}`);
-  } else if (url.includes('/live/')) {
-    const parts = url.split('/');
-    const user = parts[2] || '?';
-    const streamId = parts[4] ? parts[4].replace(/\.(m3u8|ts)$/, '') : '?';
-    console.log(`[${timestamp}] 🎬 STREAM: ${user} -> Channel ${streamId}`);
-  } else if (url.includes('/xmltv.php')) {
-    const user = req.query.username || '?';
-    console.log(`[${timestamp}] 📺 EPG: ${user}`);
-  } else if (url.includes('/reload')) {
-    console.log(`[${timestamp}] 🔄 RELOAD: ${url}`);
-  } else if (url === '/') {
-    console.log(`[${timestamp}] 🏠 HOME`);
-  } else if (url.includes('/get.php')) {
-    const user = req.query.username || '?';
-    console.log(`[${timestamp}] 📄 M3U: ${user}`);
-  } else {
-    console.log(`[${timestamp}] ${method} ${url}`);
-  }
-  
+  console.log(`${req.method} ${req.url}`);
   next();
 });
 
@@ -175,20 +142,20 @@ async function loadUserM3U(username) {
   try {
     const userConfig = users[username];
     if (!userConfig || !userConfig.m3u_url) {
-      console.log(`⚠️  No M3U URL configured for user: ${username}`);
+      console.log(`No M3U URL configured for user: ${username}`);
       return;
     }
 
-    console.log(`📥 Fetching M3U for: ${username}`);
+    console.log(`Fetching M3U for user: ${username}`);
     const content = await fetchUrl(userConfig.m3u_url);
     const result = parseM3U(content);
     
     userChannels[username] = result.channels;
     userCategories[username] = result.categories;
     
-    console.log(`✅ ${username}: ${result.channels.length} channels, ${result.categories.length} categories`);
+    console.log(`✓ Loaded ${result.channels.length} channels in ${result.categories.length} categories for ${username}`);
   } catch (error) {
-    console.error(`❌ Failed to load M3U for ${username}:`, error.message);
+    console.error(`Failed to load M3U for ${username}:`, error.message);
     userChannels[username] = [];
     userCategories[username] = [];
   }
@@ -196,74 +163,41 @@ async function loadUserM3U(username) {
 
 // Load all users' M3U files on startup
 async function loadAllUsers() {
-  console.log('\n🔄 Loading M3U files for all users...\n');
+  console.log('Loading M3U files for all users...');
   for (const username of Object.keys(users)) {
     await loadUserM3U(username);
   }
-  console.log('\n✅ All users loaded!\n');
+  console.log('All users loaded!');
 }
 
 // Root endpoint
 app.get('/', (req, res) => {
-  const userStats = Object.keys(users).map(u => {
-    const channels = userChannels[u]?.length || 0;
-    const categories = userCategories[u]?.length || 0;
-    const epg = userEPG[u] ? '✅' : '❌';
-    return `<tr><td>${u}</td><td>${channels}</td><td>${categories}</td><td>${epg}</td></tr>`;
-  }).join('');
+  const userStats = Object.keys(users).map(u => 
+    `${u}: ${userChannels[u]?.length || 0} channels, ${userCategories[u]?.length || 0} categories`
+  ).join('<br>');
   
   res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Xtream Bridge Server</title>
-      <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-        h1 { color: #333; }
-        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background-color: #f2f2f2; }
-        .btn { display: inline-block; padding: 10px 20px; margin: 10px 5px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }
-        .btn:hover { background: #0056b3; }
-      </style>
-    </head>
-    <body>
-      <h1>🎬 Xtream Bridge Server</h1>
-      <table>
-        <thead>
-          <tr>
-            <th>User</th>
-            <th>Channels</th>
-            <th>Categories</th>
-            <th>EPG</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${userStats}
-        </tbody>
-      </table>
-      <div>
-        <a href="/reload-all" class="btn">🔄 Reload All Users</a>
-      </div>
-    </body>
-    </html>
+    <h1>Xtream Bridge Server</h1>
+    <h2>Users:</h2>
+    <p>${userStats}</p>
+    <p><a href="/reload-all">Reload All Users</a></p>
   `);
 });
 
 // Reload all users
 app.get('/reload-all', async (req, res) => {
   await loadAllUsers();
-  res.send('<h2>✅ All users reloaded!</h2><a href="/">← Back</a>');
+  res.send('<h2>All users reloaded!</h2><a href="/">Back</a>');
 });
 
 // Reload specific user
 app.get('/reload/:username', async (req, res) => {
   const username = req.params.username;
   if (!users[username]) {
-    return res.status(404).send('❌ User not found');
+    return res.status(404).send('User not found');
   }
   await loadUserM3U(username);
-  res.send(`<h2>✅ User ${username} reloaded!</h2><a href="/">← Back</a>`);
+  res.send(`<h2>User ${username} reloaded!</h2><a href="/">Back</a>`);
 });
 
 // Authentication middleware - CASE INSENSITIVE
@@ -271,25 +205,29 @@ function authenticate(req, res, next) {
   const username = (req.query.username || req.body.username || '').toLowerCase();
   const password = req.query.password || req.body.password;
   
+  console.log(`🔐 Auth attempt: username="${username}"`);
+  
   // Find user case-insensitively
   const actualUsername = Object.keys(users).find(u => u.toLowerCase() === username);
   
   if (actualUsername && users[actualUsername].password === password) {
+    console.log(`✓ Auth success for: ${actualUsername}`);
     req.user = actualUsername;
     
     // Load user's M3U if not already loaded
     if (!userChannels[actualUsername]) {
-      console.log(`🔑 First login for ${actualUsername}, loading M3U...`);
+      console.log(`First login for ${actualUsername}, loading M3U...`);
       loadUserM3U(actualUsername).then(() => {
         next();
       }).catch(err => {
-        console.error(`❌ Failed to load M3U for ${actualUsername}:`, err);
+        console.error(`Failed to load M3U for ${actualUsername}:`, err);
         next();
       });
     } else {
       next();
     }
   } else {
+    console.log(`❌ Auth failed`);
     return res.status(403).json({ 
       user_info: { 
         auth: 0, 
@@ -309,17 +247,23 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   const actualUsername = Object.keys(users).find(u => u.toLowerCase() === usernameLower);
   
   if (!actualUsername || users[actualUsername].password !== password) {
+    console.log('❌ Stream auth failed');
     return res.status(403).send('Invalid credentials');
   }
   
   const cleanStreamId = parseInt(stream_id.replace(/\.(m3u8|ts)$/, ''));
   
+  console.log(`🎬 Stream request: User=${actualUsername}, StreamID=${cleanStreamId}`);
+  
   const channels = userChannels[actualUsername] || [];
   const channel = channels.find(ch => ch.stream_id === cleanStreamId);
   
   if (!channel) {
+    console.log(`❌ Channel not found: ${cleanStreamId}`);
     return res.status(404).send('Channel not found');
   }
+  
+  console.log(`✓ Proxying: ${channel.name}`);
   
   const streamUrl = channel.direct_source;
   const client = streamUrl.startsWith('https') ? https : http;
@@ -354,6 +298,8 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
 app.get('/player_api.php', authenticate, (req, res) => {
   const action = req.query.action;
   const categoryId = req.query.category_id;
+  
+  console.log(`📡 API Call: action="${action}", user="${req.user}"`);
 
   const channels = userChannels[req.user] || [];
   const categories = userCategories[req.user] || [];
@@ -389,15 +335,18 @@ app.get('/player_api.php', authenticate, (req, res) => {
       }
     };
     
+    console.log(`✓ Sending login response for ${req.user}`);
     return res.json(response);
   }
 
   if (action === 'get_live_categories') {
+    console.log(`✓ Returning ${categories.length} categories for ${req.user}`);
     return res.json(categories);
   }
 
   if (action === 'get_live_streams') {
     let filtered = categoryId ? channels.filter(ch => ch.category_id === categoryId) : channels;
+    console.log(`✓ Returning ${filtered.length} channels for ${req.user}`);
     return res.json(filtered);
   }
 
@@ -434,9 +383,12 @@ app.get('/get.php', authenticate, (req, res) => {
 
 // EPG endpoint - per user
 app.get('/xmltv.php', authenticate, async (req, res) => {
+  console.log(`📺 EPG requested for ${req.user}`);
+  
   try {
     const userConfig = users[req.user];
     if (!userConfig || !userConfig.epg_url) {
+      console.log(`No EPG URL configured for ${req.user}`);
       res.setHeader('Content-Type', 'application/xml');
       return res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
     }
@@ -446,11 +398,13 @@ app.get('/xmltv.php', authenticate, async (req, res) => {
     const cached = userEPG[req.user];
     
     if (cached && (now - cached.lastFetched) < EPG_CACHE_DURATION) {
+      console.log(`✓ Returning cached EPG for ${req.user}`);
       res.setHeader('Content-Type', 'application/xml');
       return res.send(cached.data);
     }
     
     // Fetch fresh EPG
+    console.log(`Fetching fresh EPG for ${req.user}...`);
     const epgData = await fetchUrl(userConfig.epg_url);
     
     // Cache it
@@ -459,7 +413,7 @@ app.get('/xmltv.php', authenticate, async (req, res) => {
       lastFetched: now
     };
     
-    console.log(`✅ EPG loaded for ${req.user} (${(epgData.length / 1024).toFixed(0)} KB)`);
+    console.log(`✓ EPG loaded for ${req.user} (${(epgData.length / 1024).toFixed(0)} KB)`);
     res.setHeader('Content-Type', 'application/xml');
     res.send(epgData);
   } catch (error) {
@@ -471,28 +425,8 @@ app.get('/xmltv.php', authenticate, async (req, res) => {
 
 // Start server and load all users
 app.listen(PORT, async () => {
-  console.log(`\n🚀 Server running on ${SERVER_URL}`);
-  console.log(`📡 API endpoint: ${SERVER_URL}/player_api.php\n`);
+  console.log(`Server running on ${SERVER_URL}`);
+  console.log(`API endpoint: ${SERVER_URL}/player_api.php`);
+  console.log('');
   await loadAllUsers();
 });
-```
-
-**Now your logs will be clean and clear:**
-```
-🚀 Server running on https://xtream-bridge.onrender.com
-📡 API endpoint: https://xtream-bridge.onrender.com/player_api.php
-
-🔄 Loading M3U files for all users...
-
-📥 Fetching M3U for: dad
-✅ dad: 7239 channels, 66 categories
-📥 Fetching M3U for: john
-✅ john: 7239 channels, 66 categories
-...
-
-✅ All users loaded!
-
-[13:45:22] 📡 API: john -> login
-[13:45:23] 📡 API: john -> get_live_categories
-[13:45:24] 🎬 STREAM: john -> Channel 1234
-[13:46:15] 📺 EPG: john
