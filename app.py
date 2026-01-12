@@ -19,11 +19,22 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 function normalizeDropbox(url) {
   // Ensure direct download (Dropbox sometimes serves HTML if not dl=1)
-  // If you already have dl=1, this keeps it.
   if (!url) return url;
-  const u = new URL(url);
-  u.searchParams.set('dl', '1');
-  return u.toString();
+  try {
+    const u = new URL(url);
+    u.searchParams.set('dl', '1');
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+function safeHost(u) {
+  try {
+    return new URL(u).host;
+  } catch {
+    return 'unknown';
+  }
 }
 
 async function loadPlaylistForUser(username) {
@@ -40,10 +51,15 @@ async function loadPlaylistForUser(username) {
 
   const response = await axios.get(m3uUrl, {
     timeout: 20000,
-    // Some hosts are picky; setting UA can help
-    headers: { 'User-Agent': 'Mozilla/5.0 (M3U Proxy)' },
+    headers: {
+      // IPTV providers often hate "node/axios" looking clients
+      'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
+      'Accept': '*/*'
+    },
     maxContentLength: Infinity,
-    maxBodyLength: Infinity
+    maxBodyLength: Infinity,
+    // Avoid axios throwing on 30x/40x if you want to inspect later (not needed here but safe)
+    validateStatus: (s) => s >= 200 && s < 400
   });
 
   const parser = new M3UParser();
@@ -74,7 +90,10 @@ function authenticate(req, res, next) {
   }
 }
 
-// Xtream API: player_api.php
+/**
+ * Xtream API: player_api.php
+ * Returns JSON with channels in available_channels
+ */
 app.get('/player_api.php', authenticate, async (req, res) => {
   try {
     const channels = await loadPlaylistForUser(req.user);
@@ -99,7 +118,9 @@ app.get('/player_api.php', authenticate, async (req, res) => {
   }
 });
 
-// Xtream API: get.php (returns M3U)
+/**
+ * Xtream API: get.php (returns M3U)
+ */
 app.get('/get.php', authenticate, async (req, res) => {
   try {
     const channels = await loadPlaylistForUser(req.user);
@@ -109,8 +130,116 @@ app.get('/get.php', authenticate, async (req, res) => {
       .join('\n');
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-store'); // helps with app/proxy caching
+    res.setHeader('Cache-Control', 'no-store');
     res.send(`#EXTM3U\n${m3uContent}`);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * DEBUG: Inspect stream URLs inside the playlist
+ *
+ * Query params:
+ * - contains: substring filter for URLs (e.g. defaultgen.com:5050)
+ * - limit: number of samples returned (max 200)
+ */
+app.get('/debug/streams', authenticate, async (req, res) => {
+  try {
+    const { contains = '', limit = '20' } = req.query;
+    const channels = await loadPlaylistForUser(req.user);
+
+    // Group counts by hostname
+    const countsByHost = {};
+    for (const ch of channels) {
+      const host = safeHost(ch.stream_url);
+      countsByHost[host] = (countsByHost[host] || 0) + 1;
+    }
+
+    const n = Math.max(1, Math.min(parseInt(limit, 10) || 20, 200));
+    const samples = channels
+      .filter(ch => !contains || (ch.stream_url || '').includes(contains))
+      .slice(0, n)
+      .map(ch => ({ name: ch.name, url: ch.stream_url, host: safeHost(ch.stream_url) }));
+
+    res.json({
+      user: req.user,
+      total_channels: channels.length,
+      contains,
+      sample_count: samples.length,
+      countsByHost,
+      samples
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * DEBUG: Probe a single stream URL from the Render server
+ * This helps confirm IP/UA restrictions:
+ *
+ * /debug/probe?username=main&password=admin&url=http://defaultgen.com:5050/live/user/pass/123.ts
+ *
+ * Notes:
+ * - validateStatus() keeps axios from throwing on 401/403 etc.
+ * - We only fetch headers + status; NOT downloading full stream.
+ */
+app.get('/debug/probe', authenticate, async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: 'Missing url=' });
+
+    // Basic guard: only allow http(s)
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return res.status(400).json({ error: 'Invalid url' });
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return res.status(400).json({ error: 'Only http/https URLs allowed' });
+    }
+
+    // Use a HEAD first (lighter). If provider blocks HEAD, fallback to GET with Range.
+    let r;
+    try {
+      r = await axios.head(url, {
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
+          'Accept': '*/*'
+        },
+        validateStatus: () => true
+      });
+    } catch {
+      r = await axios.get(url, {
+        timeout: 15000,
+        headers: {
+          'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
+          'Accept': '*/*',
+          // Request only first bytes so we don't pull a whole stream
+          'Range': 'bytes=0-2047'
+        },
+        responseType: 'arraybuffer',
+        validateStatus: () => true
+      });
+    }
+
+    res.json({
+      probed_host: safeHost(url),
+      status: r.status,
+      statusText: r.statusText,
+      // return a small, useful subset of headers
+      headers: {
+        'content-type': r.headers?.['content-type'],
+        'content-length': r.headers?.['content-length'],
+        'www-authenticate': r.headers?.['www-authenticate'],
+        'server': r.headers?.['server'],
+        'date': r.headers?.['date'],
+        'location': r.headers?.['location']
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
