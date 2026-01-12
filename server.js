@@ -396,11 +396,11 @@ app.get('/player_api.php', authenticate, (req, res) => {
         message: '',
         auth: 1,
         status: 'Active',
-        exp_date: '1767225600',
+        exp_date: '1767225599',
         is_trial: '0',
         active_cons: '0',
         created_at: '1640995200',
-        max_connections: '1',
+        max_connections: '2',
         allowed_output_formats: ['m3u8', 'ts']
       },
       server_info: {
