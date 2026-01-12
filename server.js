@@ -1,8 +1,11 @@
 /**
- * server.js — Full drop-in file
- * - Keeps your current Xtream portal behaviour
- * - Adds BYPASS_PROXY_HOSTS so strict providers (e.g. defaultgen.com:5050) are NOT proxied via Render
- * - Adds /debug/streams and /debug/probe to inspect and confirm 401s
+ * server.js — Full drop-in file (UPDATED)
+ * - Node/Express Xtream portal
+ * - Loads per-user M3U -> channels + categories
+ * - /get.php outputs proxied URLs by default, BUT outputs direct provider URLs for BYPASS_PROXY_HOSTS
+ * - /live/... proxies streams for allowed providers
+ * - IMPORTANT UPDATE: for BYPASS_PROXY_HOSTS, /live/... now 302 REDIRECTS to the provider URL (no more 409)
+ * - Adds /debug/streams + /debug/probe
  */
 
 const express = require('express');
@@ -17,11 +20,11 @@ const PORT = process.env.PORT || 3000;
 const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
 
 // Providers that commonly block server-side proxy/VPS fetching (401 from Render).
-// When a channel's direct_source host matches this list, we will NOT proxy it via /live/.
-// Instead, we will output the original provider URL directly in /get.php.
+// For these, we do NOT proxy server-side; we output direct URLs in /get.php
+// and /live/... will REDIRECT the client to the provider URL.
 const BYPASS_PROXY_HOSTS = new Set([
   'defaultgen.com:5050',
-  // add more here as needed, e.g. 'somepanel.example:8080'
+  // add more here as needed
 ]);
 
 function getHost(u) {
@@ -67,6 +70,7 @@ function fetchUrl(url) {
     client.get(url, {
       headers: { 'User-Agent': 'Mozilla/5.0' }
     }, (res) => {
+      // Follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchUrl(res.headers.location).then(resolve).catch(reject);
       }
@@ -281,7 +285,7 @@ app.get('/debug/streams', authenticate, (req, res) => {
 
 /**
  * DEBUG: Probe a single provider URL FROM Render (confirms 401 blocks)
- * /debug/probe?username=main&password=admin&url=http://defaultgen.com:5050/live/USER/PASS/123.ts
+ * /debug/probe?username=main&password=admin&url=http://defaultgen.com:5050/live/USER/PASS/507878.ts
  */
 app.get('/debug/probe', authenticate, (req, res) => {
   const url = req.query.url;
@@ -294,11 +298,9 @@ app.get('/debug/probe', authenticate, (req, res) => {
     headers: {
       'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
       'Accept': '*/*',
-      // avoid downloading a full stream
       'Range': 'bytes=0-2047'
     }
   }, (up) => {
-    // we only need the status + a couple headers
     up.destroy();
     res.json({
       host: getHost(url),
@@ -343,10 +345,10 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   const streamUrl = channel.direct_source;
   const host = getHost(streamUrl);
 
-  // If this provider blocks proxying, fail fast with a clearer message.
+  // ✅ UPDATED: For bypass hosts, redirect client directly to provider URL (no 409)
   if (BYPASS_PROXY_HOSTS.has(host)) {
-    console.log(`🚫 Proxy blocked for host ${host} (bypassed in get.php)`);
-    return res.status(409).send(`Proxy disabled for this provider (${host}). Use direct URL from /get.php output.`);
+    console.log(`↪️ Redirecting (bypass) for host ${host}`);
+    return res.redirect(302, streamUrl);
   }
 
   console.log(`✓ Proxying: ${channel.name} -> ${host}`);
