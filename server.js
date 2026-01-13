@@ -1,11 +1,16 @@
 /**
- * server.js — Full drop-in file (UPDATED)
- * - Node/Express Xtream portal
- * - Loads per-user M3U -> channels + categories
- * - /get.php outputs proxied URLs by default, BUT outputs direct provider URLs for BYPASS_PROXY_HOSTS
- * - /live/... proxies streams for allowed providers
- * - IMPORTANT UPDATE: for BYPASS_PROXY_HOSTS, /live/... now 302 REDIRECTS to the provider URL (no more 409)
- * - Adds /debug/streams + /debug/probe
+ * server.js — FULL CODE (NO STREAM PROXYING)
+ *
+ * Key behaviour:
+ * - /player_api.php: Xtream API (login + categories + streams)
+ * - /get.php: returns an M3U pointing at YOUR /live/... URLs (stable)
+ * - /live/...: ALWAYS 302 redirects the client to the provider (zero video bandwidth on Render)
+ * - /xmltv.php: per-user EPG with 6h cache
+ * - /debug/streams + /debug/probe: diagnostics
+ *
+ * Result:
+ * - Render never carries video bytes (no proxy streaming)
+ * - Clients can still use Xtream-style /live/<user>/<pass>/<id>.ts URLs
  */
 
 const express = require('express');
@@ -18,14 +23,6 @@ const PORT = process.env.PORT || 3000;
 
 // IMPORTANT: Set your public URL here
 const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
-
-// Providers that commonly block server-side proxy/VPS fetching (401 from Render).
-// For these, we do NOT proxy server-side; we output direct URLs in /get.php
-// and /live/... will REDIRECT the client to the provider URL.
-const BYPASS_PROXY_HOSTS = new Set([
-  'defaultgen.com:5050',
-  // add more here as needed
-]);
 
 function getHost(u) {
   try { return new URL(u).host; } catch { return ''; }
@@ -62,7 +59,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helper function to fetch URL content
+// Helper function to fetch URL content (for M3U/EPG)
 function fetchUrl(url) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https') ? https : http;
@@ -103,6 +100,7 @@ function parseM3U(content) {
       const url = lines[i + 1] || '';
       if (!url || url.startsWith('#')) continue;
 
+      // Category / group-title
       let categoryName = 'Uncategorized';
       let groupMatch = extinf.match(/group-title="([^"]*)"/i);
       if (!groupMatch) groupMatch = extinf.match(/group-title=([^\s,]+)/i);
@@ -119,6 +117,7 @@ function parseM3U(content) {
       }
       const categoryId = categoryMap.get(categoryName);
 
+      // Channel name
       const nameParts = extinf.split(',');
       const channelName = nameParts[nameParts.length - 1].trim() || `Channel ${newChannels.length + 1}`;
 
@@ -142,7 +141,7 @@ function parseM3U(content) {
         tv_archive_duration: 0
       });
 
-      i++;
+      i++; // skip URL line
     }
   }
 
@@ -285,7 +284,7 @@ app.get('/debug/streams', authenticate, (req, res) => {
 
 /**
  * DEBUG: Probe a single provider URL FROM Render (confirms 401 blocks)
- * /debug/probe?username=main&password=admin&url=http://defaultgen.com:5050/live/USER/PASS/507878.ts
+ * /debug/probe?username=main&password=admin&url=http://provider:port/live/USER/PASS/ID.ts
  */
 app.get('/debug/probe', authenticate, (req, res) => {
   const url = req.query.url;
@@ -317,7 +316,14 @@ app.get('/debug/probe', authenticate, (req, res) => {
   upstreamReq.end();
 });
 
-// Stream proxy endpoint
+/**
+ * STREAM ENDPOINT (NO PROXYING):
+ * - Validates user/pass
+ * - Finds the channel by stream_id
+ * - ALWAYS redirects to provider URL
+ *
+ * This keeps Render bandwidth near-zero for video.
+ */
 app.get('/live/:username/:password/:stream_id', (req, res) => {
   const { username, password, stream_id } = req.params;
   const usernameLower = username.toLowerCase();
@@ -343,38 +349,10 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   }
 
   const streamUrl = channel.direct_source;
-  const host = getHost(streamUrl);
+  console.log(`↪️ Redirecting to provider: ${channel.name} -> ${getHost(streamUrl)}`);
 
-  // ✅ UPDATED: For bypass hosts, redirect client directly to provider URL (no 409)
-  if (BYPASS_PROXY_HOSTS.has(host)) {
-    console.log(`↪️ Redirecting (bypass) for host ${host}`);
-    return res.redirect(302, streamUrl);
-  }
-
-  console.log(`✓ Proxying: ${channel.name} -> ${host}`);
-
-  const client = streamUrl.startsWith('https') ? https : http;
-
-  const proxyReq = client.get(streamUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      'Referer': streamUrl
-    }
-  }, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
-
-    proxyRes.on('error', (err) => {
-      console.error(`❌ Stream error:`, err.message);
-    });
-  });
-
-  proxyReq.on('error', (err) => {
-    console.error(`❌ Proxy error:`, err.message);
-    if (!res.headersSent) res.status(500).send('Stream error');
-  });
-
-  req.on('close', () => proxyReq.destroy());
+  // 302 is broadly supported by IPTV apps/tools.
+  return res.redirect(302, streamUrl);
 });
 
 // Xtream API
@@ -396,11 +374,11 @@ app.get('/player_api.php', authenticate, (req, res) => {
         message: '',
         auth: 1,
         status: 'Active',
-        exp_date: '1783900799',
+        exp_date: '1767225600',
         is_trial: '0',
         active_cons: '0',
         created_at: '1640995200',
-        max_connections: '2',
+        max_connections: '1',
         allowed_output_formats: ['m3u8', 'ts']
       },
       server_info: {
@@ -447,9 +425,8 @@ app.post('/player_api.php', authenticate, (req, res) => {
 });
 
 /**
- * Get M3U file
- * - Proxies by default via /live/...
- * - But for hosts in BYPASS_PROXY_HOSTS, outputs direct provider URL
+ * Get M3U file (stable bridge URLs)
+ * Your /live/... will redirect to provider, so no video proxying happens.
  */
 app.get('/get.php', authenticate, (req, res) => {
   const username = req.query.username || req.body.username;
@@ -459,16 +436,10 @@ app.get('/get.php', authenticate, (req, res) => {
   const categories = userCategories[req.user] || [];
 
   const m3uContent = channels.map(ch => {
-    const sourceUrl = ch.direct_source;
-    const host = getHost(sourceUrl);
-
-    const outUrl = BYPASS_PROXY_HOSTS.has(host)
-      ? sourceUrl
-      : `${SERVER_URL}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${ch.stream_id}.m3u8`;
-
+    const proxyUrl = `${SERVER_URL}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${ch.stream_id}.m3u8`;
     const cat = categories.find(cat => cat.category_id === ch.category_id);
 
-    return `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${cat?.category_name || 'Uncategorized'}",${ch.name}\n${outUrl}`;
+    return `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${cat?.category_name || 'Uncategorized'}",${ch.name}\n${proxyUrl}`;
   }).join('\n');
 
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
