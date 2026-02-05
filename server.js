@@ -374,7 +374,7 @@ app.get('/player_api.php', authenticate, (req, res) => {
         message: '',
         auth: 1,
         status: 'Active',
-        exp_date: '1767225600',
+        exp_date: '1780331400',
         is_trial: '0',
         active_cons: '0',
         created_at: '1640995200',
