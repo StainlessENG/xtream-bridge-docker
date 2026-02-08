@@ -7,10 +7,12 @@
  * - /live/...: ALWAYS 302 redirects the client to the provider (zero video bandwidth on Render)
  * - /xmltv.php: per-user EPG with 6h cache
  * - /debug/streams + /debug/probe: diagnostics
+ * - AUTO-REFRESH: M3U data refreshes every 6 hours automatically
  *
  * Result:
  * - Render never carries video bytes (no proxy streaming)
  * - Clients can still use Xtream-style /live/<user>/<pass>/<id>.ts URLs
+ * - M3U and EPG data stay fresh with automatic refreshes
  */
 
 const express = require('express');
@@ -489,4 +491,14 @@ app.listen(PORT, async () => {
   console.log(`API endpoint: ${SERVER_URL}/player_api.php`);
   console.log('');
   await loadAllUsers();
+  
+  // Auto-refresh M3U data every 6 hours
+  const M3U_REFRESH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
+  setInterval(async () => {
+    console.log('🔄 Auto-refreshing M3U data for all users...');
+    await loadAllUsers();
+    console.log('✓ Auto-refresh complete');
+  }, M3U_REFRESH_INTERVAL);
+  
+  console.log(`📅 M3U auto-refresh scheduled every 6 hours`);
 });
