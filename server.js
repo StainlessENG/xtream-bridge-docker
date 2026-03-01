@@ -1,504 +1,484 @@
-/**
- * server.js — FULL CODE (NO STREAM PROXYING)
- *
- * Key behaviour:
- * - /player_api.php: Xtream API (login + categories + streams)
- * - /get.php: returns an M3U pointing at YOUR /live/... URLs (stable)
- * - /live/...: ALWAYS 302 redirects the client to the provider (zero video bandwidth on Render)
- * - /xmltv.php: per-user EPG with 6h cache
- * - /debug/streams + /debug/probe: diagnostics
- * - AUTO-REFRESH: M3U data refreshes every 6 hours automatically
- *
- * Result:
- * - Render never carries video bytes (no proxy streaming)
- * - Clients can still use Xtream-style /live/<user>/<pass>/<id>.ts URLs
- * - M3U and EPG data stay fresh with automatic refreshes
- */
+import os
+import re
+import time
+import json
+import requests
+from datetime import datetime
+from functools import wraps
 
-const express = require('express');
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
+from flask import (
+    Flask, request, redirect, url_for,
+    render_template, flash, session, Response, jsonify
+)
+from flask_sqlalchemy import SQLAlchemy
+from jinja2 import DictLoader
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+# ==========================================================
+#                    APP + CONFIG
+# ==========================================================
 
-// IMPORTANT: Set your public URL here
-const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "changeme")
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///xtream_users.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-function getHost(u) {
-  try { return new URL(u).host; } catch { return ''; }
-}
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "adminpass")
 
-// Load users with their individual M3U and EPG URLs
-const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
-console.log('Loaded users:', Object.keys(users));
+db = SQLAlchemy(app)
 
-// Per-user channels and categories cache
-const userChannels = {};    // username -> channels array
-const userCategories = {};  // username -> categories array
+# ==========================================================
+#                        DATABASE
+# ==========================================================
 
-// Per-user EPG cache
-const userEPG = {}; // username -> { data, lastFetched }
-const EPG_CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), unique=True, nullable=False)
+    password = db.Column(db.String(128), nullable=False)
+    m3u_url = db.Column(db.String(512), nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-// Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+with app.app_context():
+    db.create_all()
 
-// CORS
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+# ==========================================================
+#                        TEMPLATES
+# ==========================================================
 
-// Logging
-app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
-  next();
-});
+BASE_TEMPLATE = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Xtream Admin</title></head>
+<body style="font-family:Arial;margin:0;padding:20px">
+<header>
+  <h1>Xtream Admin</h1>
+  {% if session.get('admin_logged_in') %}
+    <a href="{{ url_for('admin_users') }}">Users</a> |
+    <a href="{{ url_for('admin_logout') }}">Logout</a>
+  {% endif %}
+</header>
+<hr>
 
-// Helper function to fetch URL content (for M3U/EPG)
-function fetchUrl(url) {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
+{% with msgs = get_flashed_messages(with_categories=true) %}
+  {% for c,m in msgs %}
+    <p><b>{{c}}</b>: {{m}}</p>
+  {% endfor %}
+{% endwith %}
 
-    client.get(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    }, (res) => {
-      // Follow redirects
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchUrl(res.headers.location).then(resolve).catch(reject);
-      }
+{% block content %}{% endblock %}
+</body>
+</html>
+"""
 
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode}`));
-      }
+LOGIN_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<h2>Admin Login</h2>
+<form method="post">
+  <p>Username: <input name="username"></p>
+  <p>Password: <input name="password" type="password"></p>
+  <button>Login</button>
+</form>
+{% endblock %}
+"""
 
-      let data = '';
-      res.on('data', chunk => (data += chunk));
-      res.on('end', () => resolve(data));
-    }).on('error', reject);
-  });
-}
+USERS_LIST_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<h2>Users</h2>
+<p><a href="{{ url_for('admin_new_user') }}">+ New User</a></p>
 
-// Helper function to parse M3U content
-function parseM3U(content) {
-  if (!content.includes('#EXTM3U')) throw new Error('Invalid M3U file');
+<table border="1" cellpadding="6">
+<tr><th>ID</th><th>User</th><th>M3U URL</th><th>Active</th><th>Actions</th></tr>
+{% for u in users %}
+<tr>
+<td>{{u.id}}</td>
+<td>{{u.username}}</td>
+<td style="max-width:300px;word-break:break-all">{{u.m3u_url}}</td>
+<td>{{"Yes" if u.is_active else "No"}}</td>
+<td>
+  <a href="{{url_for('admin_edit_user', user_id=u.id)}}">Edit</a> |
+  <form method="post" action="{{url_for('admin_delete_user',user_id=u.id)}}" style="display:inline">
+    <button onclick="return confirm('Delete?')">Delete</button>
+  </form>
+</td>
+</tr>
+{% endfor %}
+</table>
+{% endblock %}
+"""
 
-  const newChannels = [];
-  const newCategories = [];
-  const categoryMap = new Map();
-  let categoryIdCounter = 1;
+USER_FORM_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<h2>{{ "Edit User" if user else "New User" }}</h2>
+<form method="post">
+  <p>Username: <input name="username" value="{{ user.username if user else '' }}"></p>
+  <p>Password: <input name="password" value="{{ user.password if user else '' }}"></p>
+  <p>M3U URL: <input name="m3u_url" size="80" value="{{ user.m3u_url if user else '' }}"></p>
+  <p>Active: <input type="checkbox" name="is_active" value="1" {% if user and user.is_active %}checked{% endif %}></p>
+  <button>Save</button>
+</form>
+{% endblock %}
+"""
 
-  const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
+app.jinja_loader = DictLoader({
+    "base.html": BASE_TEMPLATE,
+    "login.html": LOGIN_TEMPLATE,
+    "users_list.html": USERS_LIST_TEMPLATE,
+    "user_form.html": USER_FORM_TEMPLATE
+})
 
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith('#EXTINF')) {
-      const extinf = lines[i];
-      const url = lines[i + 1] || '';
-      if (!url || url.startsWith('#')) continue;
+# ==========================================================
+#                AUTH DECORATOR
+# ==========================================================
 
-      // Category / group-title
-      let categoryName = 'Uncategorized';
-      let groupMatch = extinf.match(/group-title="([^"]*)"/i);
-      if (!groupMatch) groupMatch = extinf.match(/group-title=([^\s,]+)/i);
-      if (!groupMatch) groupMatch = extinf.match(/tvg-group="([^"]*)"/i);
-      if (groupMatch && groupMatch[1]) categoryName = groupMatch[1].trim();
+def login_required(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin_logged_in"):
+            return redirect(url_for("admin_login"))
+        return view(*args, **kwargs)
+    return wrapper
 
-      if (!categoryMap.has(categoryName)) {
-        categoryMap.set(categoryName, categoryIdCounter++);
-        newCategories.push({
-          category_id: categoryMap.get(categoryName).toString(),
-          category_name: categoryName,
-          parent_id: 0
-        });
-      }
-      const categoryId = categoryMap.get(categoryName);
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if request.method == "POST":
+        if request.form["username"] == ADMIN_USERNAME and request.form["password"] == ADMIN_PASSWORD:
+            session["admin_logged_in"] = True
+            return redirect(url_for("admin_users"))
+        flash("Invalid login", "error")
+    return render_template("login.html")
 
-      // Channel name
-      const nameParts = extinf.split(',');
-      const channelName = nameParts[nameParts.length - 1].trim() || `Channel ${newChannels.length + 1}`;
+@app.route("/admin/logout")
+@login_required
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
 
-      const tvgIdMatch = extinf.match(/tvg-id="([^"]*)"/i);
-      const tvgLogoMatch = extinf.match(/tvg-logo="([^"]*)"/i);
+# ==========================================================
+#                USER MANAGEMENT
+# ==========================================================
 
-      const streamId = newChannels.length + 1;
+@app.route("/admin/users")
+@login_required
+def admin_users():
+    return render_template("users_list.html", users=User.query.all())
 
-      newChannels.push({
-        num: streamId,
-        name: channelName,
-        stream_type: 'live',
-        stream_id: streamId,
-        stream_icon: tvgLogoMatch ? tvgLogoMatch[1] : '',
-        epg_channel_id: tvgIdMatch ? tvgIdMatch[1] : null,
-        added: Math.floor(Date.now() / 1000).toString(),
-        category_id: categoryId.toString(),
-        custom_sid: '',
-        tv_archive: 0,
-        direct_source: url.trim(),
-        tv_archive_duration: 0
-      });
+@app.route("/admin/users/new", methods=["GET","POST"])
+@login_required
+def admin_new_user():
+    if request.method == "POST":
+        u = request.form["username"]
+        p = request.form["password"]
+        m = request.form["m3u_url"]
+        a = request.form.get("is_active") == "1"
 
-      i++; // skip URL line
+        if User.query.filter_by(username=u).first():
+            flash("User exists", "error")
+        else:
+            db.session.add(User(username=u, password=p, m3u_url=m, is_active=a))
+            db.session.commit()
+            return redirect(url_for("admin_users"))
+
+    return render_template("user_form.html", user=None)
+
+@app.route("/admin/users/<int:user_id>/edit", methods=["GET","POST"])
+@login_required
+def admin_edit_user(user_id):
+    user = User.query.get_or_404(user_id)
+    old_m3u = user.m3u_url
+
+    if request.method == "POST":
+        user.username = request.form["username"]
+        user.password = request.form["password"]
+        user.m3u_url = request.form["m3u_url"]
+        user.is_active = request.form.get("is_active") == "1"
+        db.session.commit()
+
+        if old_m3u in M3U_CACHE:
+            del M3U_CACHE[old_m3u]
+        for k in list(M3U_CACHE.keys()):
+            if k.startswith("EPG_"):
+                del M3U_CACHE[k]
+
+        return redirect(url_for("admin_users"))
+
+    return render_template("user_form.html", user=user)
+
+@app.route("/admin/users/<int:user_id>/delete", methods=["POST"])
+@login_required
+def admin_delete_user(user_id):
+    u = User.query.get_or_404(user_id)
+    db.session.delete(u)
+    db.session.commit()
+    return redirect(url_for("admin_users"))
+
+# ==========================================================
+#                M3U PARSER + CACHE + EPG
+# ==========================================================
+
+M3U_CACHE = {}
+CACHE_TTL = 300
+EPG_TTL = 600
+
+def xtream_auth(username, password):
+    u = User.query.filter_by(username=username, password=password).first()
+    return u if u and u.is_active else None
+
+def fetch_and_parse_m3u(url):
+    try:
+        text = requests.get(url, timeout=15).text
+    except Exception as e:
+        print("Error fetching M3U:", e)
+        return [], None
+
+    lines = text.splitlines()
+    epg_url = None
+
+    if lines and lines[0].startswith("#EXTM3U"):
+        m = re.search(r'url-tvg="(.*?)"', lines[0])
+        if m:
+            epg_url = m.group(1)
+
+    out = []
+    sid = 1000
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("#EXTINF"):
+            name = re.search(r",(.+)$", line)
+            name = name.group(1) if name else "Unknown"
+
+            logo = re.search(r'tvg-logo="(.*?)"', line)
+            logo = logo.group(1) if logo else ""
+
+            group = re.search(r'group-title="(.*?)"', line)
+            group = group.group(1) if group else "Other"
+
+            tvg_id_match = re.search(r'tvg-id="(.*?)"', line)
+            tvg_id = tvg_id_match.group(1) if tvg_id_match else ""
+
+            url_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+
+            out.append({
+                "id": sid,
+                "name": name,
+                "logo": logo,
+                "group": group,
+                "url": url_line,
+                "tvg_id": tvg_id
+            })
+            sid += 1
+        i += 1
+
+    return out, epg_url
+
+def get_playlist_data(url):
+    now = time.time()
+    if url in M3U_CACHE and (now - M3U_CACHE[url]["ts"] < CACHE_TTL):
+        return M3U_CACHE[url]
+
+    chans, epg_url = fetch_and_parse_m3u(url)
+
+    groups = []
+    for c in chans:
+        if c["group"] not in groups:
+            groups.append(c["group"])
+
+    M3U_CACHE[url] = {
+        "channels": chans,
+        "groups": groups,
+        "epg_url": epg_url,
+        "ts": now
     }
-  }
+    return M3U_CACHE[url]
 
-  return { channels: newChannels, categories: newCategories };
-}
+# ==========================================================
+#              HELPER: get public base URL
+# ==========================================================
 
-// Load M3U for a specific user
-async function loadUserM3U(username) {
-  try {
-    const userConfig = users[username];
-    if (!userConfig || !userConfig.m3u_url) {
-      console.log(`No M3U URL configured for user: ${username}`);
-      return;
-    }
+def get_base_url():
+    """
+    Returns (scheme, host, port_str) suitable for building Xtream URLs.
+    On Railway (and most PaaS), the app sits behind a reverse proxy on port 443/80.
+    We use X-Forwarded-Proto / X-Forwarded-Host when available.
+    """
+    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host   = request.headers.get("X-Forwarded-Host", request.host)
 
-    console.log(`Fetching M3U for user: ${username}`);
-    const content = await fetchUrl(userConfig.m3u_url);
-    const result = parseM3U(content);
+    # host may be "myapp.railway.app" (no port) or "host:port"
+    if ":" in host:
+        hostname, port_str = host.rsplit(":", 1)
+    else:
+        hostname = host
+        port_str = "443" if scheme == "https" else "80"
 
-    userChannels[username] = result.channels;
-    userCategories[username] = result.categories;
+    return scheme, hostname, port_str
 
-    console.log(`✓ Loaded ${result.channels.length} channels in ${result.categories.length} categories for ${username}`);
-  } catch (error) {
-    console.error(`Failed to load M3U for ${username}:`, error.message);
-    userChannels[username] = [];
-    userCategories[username] = [];
-  }
-}
+# ==========================================================
+#                   XTREAM API
+# ==========================================================
 
-// Load all users' M3U files on startup
-async function loadAllUsers() {
-  console.log('Loading M3U files for all users...');
-  for (const username of Object.keys(users)) {
-    await loadUserM3U(username);
-  }
-  console.log('All users loaded!');
-}
+@app.route("/player_api.php")
+def player_api():
+    username = request.args.get("username")
+    password = request.args.get("password")
+    action   = request.args.get("action")
 
-// Root endpoint
-app.get('/', (req, res) => {
-  const userStats = Object.keys(users).map(u =>
-    `${u}: ${userChannels[u]?.length || 0} channels, ${userCategories[u]?.length || 0} categories`
-  ).join('<br>');
+    user = xtream_auth(username, password)
+    if not user:
+        return jsonify({"user_info": {"auth": 0}})
 
-  res.send(`
-    <h1>Xtream Bridge Server</h1>
-    <h2>Users:</h2>
-    <p>${userStats}</p>
-    <p><a href="/reload-all">Reload All Users</a></p>
-  `);
-});
+    playlist = get_playlist_data(user.m3u_url)
+    channels = playlist["channels"]
+    groups   = playlist["groups"]
 
-// Reload all users
-app.get('/reload-all', async (req, res) => {
-  await loadAllUsers();
-  res.send('<h2>All users reloaded!</h2><a href="/">Back</a>');
-});
+    scheme, hostname, port_str = get_base_url()
+    port_int = int(port_str)
 
-// Reload specific user
-app.get('/reload/:username', async (req, res) => {
-  const username = req.params.username;
-  if (!users[username]) return res.status(404).send('User not found');
-  await loadUserM3U(username);
-  res.send(`<h2>User ${username} reloaded!</h2><a href="/">Back</a>`);
-});
+    ua = request.headers.get("User-Agent", "").lower()
 
-// Authentication middleware - CASE INSENSITIVE
-function authenticate(req, res, next) {
-  const username = (req.query.username || req.body.username || '').toLowerCase();
-  const password = req.query.password || req.body.password;
+    # ======================================================
+    #               LOGIN RESPONSE
+    # ======================================================
+    if not action:
+        is_lite = ("iptv live" in ua) or ("cfnetwork" in ua) or ("darwin" in ua)
 
-  console.log(`🔐 Auth attempt: username="${username}"`);
+        server_info = {
+            "url": hostname,
+            "port": port_int,
+            "https_port": 443,
+            "server_protocol": scheme,
+            "timezone": "Europe/London",
+            "timestamp_now": int(time.time())
+        }
 
-  // Find user case-insensitively
-  const actualUsername = Object.keys(users).find(u => u.toLowerCase() === username);
+        user_info_base = {
+            "auth": 1,
+            "username": user.username,
+            "password": user.password,
+            "status": "Active",
+            "exp_date": None,
+            "max_connections": 1,
+        }
 
-  if (actualUsername && users[actualUsername].password === password) {
-    console.log(`✓ Auth success for: ${actualUsername}`);
-    req.user = actualUsername;
+        if is_lite:
+            user_info_base["allowed_output_formats"] = ["ts"]
+        else:
+            user_info_base["allowed_output_formats"] = ["ts", "m3u8"]
 
-    // Load user's M3U if not already loaded
-    if (!userChannels[actualUsername]) {
-      console.log(`First login for ${actualUsername}, loading M3U...`);
-      loadUserM3U(actualUsername)
-        .then(() => next())
-        .catch(err => {
-          console.error(`Failed to load M3U for ${actualUsername}:`, err.message);
-          next();
-        });
-    } else {
-      next();
-    }
-  } else {
-    console.log(`❌ Auth failed`);
-    return res.status(403).json({
-      user_info: {
-        auth: 0,
-        status: 'Disabled',
-        message: 'Invalid credentials'
-      }
-    });
-  }
-}
+        return jsonify({"user_info": user_info_base, "server_info": server_info})
 
-/**
- * DEBUG: Inspect direct_source URLs for a user
- * /debug/streams?username=main&password=admin&contains=defaultgen.com:5050&limit=10
- */
-app.get('/debug/streams', authenticate, (req, res) => {
-  const contains = req.query.contains || '';
-  const limit = Math.max(1, Math.min(parseInt(req.query.limit || '20', 10), 200));
+    # ======================================================
+    #                LIVE CATEGORIES
+    # ======================================================
+    if action == "get_live_categories":
+        payload = [
+            {"category_id": str(i + 1), "category_name": g, "parent_id": 0}
+            for i, g in enumerate(groups)
+        ]
+        return Response(json.dumps(payload), mimetype="application/json")
 
-  const channels = userChannels[req.user] || [];
+    # ======================================================
+    #                 LIVE STREAMS
+    # ======================================================
+    if action == "get_live_streams":
+        cat_map = {g: (i + 1) for i, g in enumerate(groups)}
 
-  const countsByHost = {};
-  for (const ch of channels) {
-    const host = getHost(ch.direct_source);
-    countsByHost[host] = (countsByHost[host] || 0) + 1;
-  }
+        payload = []
+        for c in channels:
+            stream_url = (
+                f"{scheme}://{hostname}"
+                + (f":{port_int}" if port_int not in (80, 443) else "")
+                + f"/live/{user.username}/{user.password}/{c['id']}.ts"
+            )
+            payload.append({
+                "num": c["id"],
+                "stream_id": c["id"],
+                "name": c["name"],
+                "stream_type": "live",
+                "stream_icon": c["logo"],
+                "category_id": str(cat_map[c["group"]]),
+                "custom_sid": "",
+                "direct_source": "",
+                "tv_archive": 0,
+                "container_extension": "ts",
+                "epg_channel_id": c.get("tvg_id", ""),
+                "stream_url": stream_url
+            })
 
-  const samples = channels
-    .filter(ch => !contains || (ch.direct_source || '').includes(contains))
-    .slice(0, limit)
-    .map(ch => ({
-      name: ch.name,
-      host: getHost(ch.direct_source),
-      url: ch.direct_source
-    }));
+        return Response(json.dumps(payload), mimetype="application/json")
 
-  res.json({
-    user: req.user,
-    total_channels: channels.length,
-    contains,
-    sample_count: samples.length,
-    countsByHost,
-    samples
-  });
-});
+    # ======================================================
+    #        Empty endpoints (VOD/SERIES)
+    # ======================================================
+    if action in ["get_vod_categories", "get_vod_streams",
+                  "get_series_categories", "get_series", "get_series_info"]:
+        return Response("[]", mimetype="application/json")
 
-/**
- * DEBUG: Probe a single provider URL FROM Render (confirms 401 blocks)
- * /debug/probe?username=main&password=admin&url=http://provider:port/live/USER/PASS/ID.ts
- */
-app.get('/debug/probe', authenticate, (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'Missing url=' });
+    return jsonify({"error": "Invalid action"})
 
-  const client = url.startsWith('https') ? https : http;
+# ==========================================================
+#                       XMLTV (EPG)
+# ==========================================================
 
-  const upstreamReq = client.request(url, {
-    method: 'GET',
-    headers: {
-      'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
-      'Accept': '*/*',
-      'Range': 'bytes=0-2047'
-    }
-  }, (up) => {
-    up.destroy();
-    res.json({
-      host: getHost(url),
-      status: up.statusCode,
-      headers: {
-        'content-type': up.headers['content-type'],
-        'www-authenticate': up.headers['www-authenticate'],
-        'server': up.headers['server']
-      }
-    });
-  });
+@app.route("/xmltv.php")
+def xmltv():
+    username = request.args.get("username")
+    password = request.args.get("password")
 
-  upstreamReq.on('error', (e) => res.status(500).json({ error: e.message }));
-  upstreamReq.end();
-});
+    user = xtream_auth(username, password)
+    if not user:
+        return "Auth failed", 401
 
-/**
- * STREAM ENDPOINT (NO PROXYING):
- * - Validates user/pass
- * - Finds the channel by stream_id
- * - ALWAYS redirects to provider URL
- *
- * This keeps Render bandwidth near-zero for video.
- */
-app.get('/live/:username/:password/:stream_id', (req, res) => {
-  const { username, password, stream_id } = req.params;
-  const usernameLower = username.toLowerCase();
+    playlist = get_playlist_data(user.m3u_url)
+    epg_url  = playlist.get("epg_url")
 
-  // Case-insensitive auth for streams
-  const actualUsername = Object.keys(users).find(u => u.toLowerCase() === usernameLower);
+    if not epg_url:
+        return Response("<tv></tv>", mimetype="application/xml")
 
-  if (!actualUsername || users[actualUsername].password !== password) {
-    console.log('❌ Stream auth failed');
-    return res.status(403).send('Invalid credentials');
-  }
+    cache_key = "EPG_" + epg_url
+    now = time.time()
 
-  const cleanStreamId = parseInt(stream_id.replace(/\.(m3u8|ts)$/, ''), 10);
+    if cache_key in M3U_CACHE and now - M3U_CACHE[cache_key]["ts"] < EPG_TTL:
+        return Response(M3U_CACHE[cache_key]["xml"], mimetype="application/xml")
 
-  console.log(`🎬 Stream request: User=${actualUsername}, StreamID=${cleanStreamId}`);
+    try:
+        xml = requests.get(epg_url, timeout=20).text
+    except Exception as e:
+        print("Error fetching EPG:", e)
+        xml = "<tv></tv>"
 
-  const channels = userChannels[actualUsername] || [];
-  const channel = channels.find(ch => ch.stream_id === cleanStreamId);
+    M3U_CACHE[cache_key] = {"xml": xml, "ts": now}
+    return Response(xml, mimetype="application/xml")
 
-  if (!channel) {
-    console.log(`❌ Channel not found: ${cleanStreamId}`);
-    return res.status(404).send('Channel not found');
-  }
+# ==========================================================
+#                   STREAM REDIRECTOR
+# ==========================================================
 
-  const streamUrl = channel.direct_source;
-  console.log(`↪️ Redirecting to provider: ${channel.name} -> ${getHost(streamUrl)}`);
+@app.route("/live/<username>/<password>/<int:stream_id>.<ext>")
+def live_redirect(username, password, stream_id, ext):
+    print(f"[STREAM REQUEST] {username} {stream_id}.{ext}")
 
-  // 302 is broadly supported by IPTV apps/tools.
-  return res.redirect(302, streamUrl);
-});
+    user = xtream_auth(username, password)
+    if not user:
+        return "Auth failed", 401
 
-// Xtream API
-app.get('/player_api.php', authenticate, (req, res) => {
-  const action = req.query.action;
-  const categoryId = req.query.category_id;
+    playlist = get_playlist_data(user.m3u_url)
+    chan = next((c for c in playlist["channels"] if c["id"] == stream_id), None)
 
-  console.log(`📡 API Call: action="${action}", user="${req.user}"`);
+    if not chan:
+        return "Stream not found", 404
 
-  const channels = userChannels[req.user] || [];
-  const categories = userCategories[req.user] || [];
+    return redirect(chan["url"], code=302)
 
-  // Default response (login check)
-  if (!action) {
-    const response = {
-      user_info: {
-        username: req.user,
-        password: users[req.user].password,
-        message: '',
-        auth: 1,
-        status: 'Active',
-        exp_date: '1780331400',
-        is_trial: '0',
-        active_cons: '0',
-        created_at: '1640995200',
-        max_connections: '5',
-        allowed_output_formats: ['m3u8', 'ts']
-      },
-      server_info: {
-        xui: true,
-        version: '1.0.0',
-        revision: 1,
-        url: 'xtream-bridge.onrender.com',
-        port: '443',
-        https_port: '443',
-        server_protocol: 'https',
-        rtmp_port: '1935',
-        timezone: 'UTC',
-        timestamp_now: Math.floor(Date.now() / 1000),
-        time_now: new Date().toISOString().replace('T', ' ').substring(0, 19)
-      }
-    };
+# ==========================================================
+#                        RUN SERVER
+# ==========================================================
 
-    console.log(`✓ Sending login response for ${req.user}`);
-    return res.json(response);
-  }
-
-  if (action === 'get_live_categories') {
-    console.log(`✓ Returning ${categories.length} categories for ${req.user}`);
-    return res.json(categories);
-  }
-
-  if (action === 'get_live_streams') {
-    const filtered = categoryId ? channels.filter(ch => ch.category_id === categoryId) : channels;
-    console.log(`✓ Returning ${filtered.length} channels for ${req.user}`);
-    return res.json(filtered);
-  }
-
-  if (action === 'get_vod_categories') return res.json([]);
-  if (action === 'get_vod_streams') return res.json([]);
-  if (action === 'get_series_categories') return res.json([]);
-  if (action === 'get_series') return res.json([]);
-
-  res.json({ error: 'Unknown action' });
-});
-
-app.post('/player_api.php', authenticate, (req, res) => {
-  req.query = { ...req.query, ...req.body };
-  app._router.handle(req, res);
-});
-
-/**
- * Get M3U file (stable bridge URLs)
- * Your /live/... will redirect to provider, so no video proxying happens.
- */
-app.get('/get.php', authenticate, (req, res) => {
-  const username = req.query.username || req.body.username;
-  const password = req.query.password || req.body.password;
-
-  const channels = userChannels[req.user] || [];
-  const categories = userCategories[req.user] || [];
-
-  const m3uContent = channels.map(ch => {
-    const proxyUrl = `${SERVER_URL}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${ch.stream_id}.m3u8`;
-    const cat = categories.find(cat => cat.category_id === ch.category_id);
-
-    return `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${cat?.category_name || 'Uncategorized'}",${ch.name}\n${proxyUrl}`;
-  }).join('\n');
-
-  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  res.send(`#EXTM3U\n${m3uContent}`);
-});
-
-// EPG endpoint - per user
-app.get('/xmltv.php', authenticate, async (req, res) => {
-  console.log(`📺 EPG requested for ${req.user}`);
-
-  try {
-    const userConfig = users[req.user];
-    if (!userConfig || !userConfig.epg_url) {
-      console.log(`No EPG URL configured for ${req.user}`);
-      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-      return res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
-    }
-
-    const now = Date.now();
-    const cached = userEPG[req.user];
-
-    if (cached && (now - cached.lastFetched) < EPG_CACHE_DURATION) {
-      console.log(`✓ Returning cached EPG for ${req.user}`);
-      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-      return res.send(cached.data);
-    }
-
-    console.log(`Fetching fresh EPG for ${req.user}...`);
-    const epgData = await fetchUrl(userConfig.epg_url);
-
-    userEPG[req.user] = { data: epgData, lastFetched: now };
-
-    console.log(`✓ EPG loaded for ${req.user} (${(epgData.length / 1024).toFixed(0)} KB)`);
-    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-    res.send(epgData);
-  } catch (error) {
-    console.error(`❌ EPG fetch failed for ${req.user}:`, error.message);
-    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-    res.send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
-  }
-});
-
-// Start server and load all users
-app.listen(PORT, async () => {
-  console.log(`Server running on ${SERVER_URL}`);
-  console.log(`API endpoint: ${SERVER_URL}/player_api.php`);
-  console.log('');
-  await loadAllUsers();
-  
-  // Auto-refresh M3U data every 6 hours
-  const M3U_REFRESH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
-  setInterval(async () => {
-    console.log('🔄 Auto-refreshing M3U data for all users...');
-    await loadAllUsers();
-    console.log('✓ Auto-refresh complete');
-  }, M3U_REFRESH_INTERVAL);
-  
-  console.log(`📅 M3U auto-refresh scheduled every 6 hours`);
-});
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
