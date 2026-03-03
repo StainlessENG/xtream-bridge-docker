@@ -309,6 +309,14 @@ app.get('/debug/probe', authenticate, (req, res) => {
   upstreamReq.end();
 });
 
+// Fix for Sparkle TV double-slash URLs (//live/...)
+app.use((req, res, next) => {
+  if (req.url.startsWith('//')) {
+    req.url = req.url.replace('//', '/');
+  }
+  next();
+});
+
 // STREAM ENDPOINT — always 302 redirects, no proxying
 app.get('/live/:username/:password/:stream_id', (req, res) => {
   const { username, password, stream_id } = req.params;
