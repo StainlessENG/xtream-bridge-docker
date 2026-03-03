@@ -1,16 +1,12 @@
 /**
- * server.js — FULL CODE (NO STREAM PROXYING)
+ * server.js — Koyeb-ready (NO STREAM PROXYING)
  *
  * Key behaviour:
  * - /player_api.php: Xtream API (login + categories + streams)
  * - /get.php: returns an M3U pointing at YOUR /live/... URLs (stable)
- * - /live/...: ALWAYS 302 redirects the client to the provider (zero video bandwidth on Render)
+ * - /live/...: ALWAYS 302 redirects the client to the provider (zero video bandwidth)
  * - /xmltv.php: per-user EPG with 6h cache
  * - /debug/streams + /debug/probe: diagnostics
- *
- * Result:
- * - Render never carries video bytes (no proxy streaming)
- * - Clients can still use Xtream-style /live/<user>/<pass>/<id>.ts URLs
  */
 
 const express = require('express');
@@ -21,11 +17,19 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// IMPORTANT: Set your public URL here
-const SERVER_URL = process.env.SERVER_URL || 'https://xtream-bridge.onrender.com';
+// Koyeb serves over HTTPS via reverse proxy — build SERVER_URL from env or fallback
+const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 
 function getHost(u) {
   try { return new URL(u).host; } catch { return ''; }
+}
+
+// Helper: get the public-facing base URL from request headers (handles Koyeb proxy)
+function getPublicBaseUrl(req) {
+  if (process.env.SERVER_URL) return process.env.SERVER_URL;
+  const proto = req.headers['x-forwarded-proto'] || req.protocol;
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${proto}://${host}`;
 }
 
 // Load users with their individual M3U and EPG URLs
@@ -33,11 +37,11 @@ const users = JSON.parse(fs.readFileSync('users.json', 'utf8'));
 console.log('Loaded users:', Object.keys(users));
 
 // Per-user channels and categories cache
-const userChannels = {};    // username -> channels array
-const userCategories = {};  // username -> categories array
+const userChannels = {};
+const userCategories = {};
 
 // Per-user EPG cache
-const userEPG = {}; // username -> { data, lastFetched }
+const userEPG = {};
 const EPG_CACHE_DURATION = 6 * 60 * 60 * 1000; // 6 hours
 
 // Middleware
@@ -67,7 +71,6 @@ function fetchUrl(url) {
     client.get(url, {
       headers: { 'User-Agent': 'Mozilla/5.0' }
     }, (res) => {
-      // Follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchUrl(res.headers.location).then(resolve).catch(reject);
       }
@@ -100,7 +103,6 @@ function parseM3U(content) {
       const url = lines[i + 1] || '';
       if (!url || url.startsWith('#')) continue;
 
-      // Category / group-title
       let categoryName = 'Uncategorized';
       let groupMatch = extinf.match(/group-title="([^"]*)"/i);
       if (!groupMatch) groupMatch = extinf.match(/group-title=([^\s,]+)/i);
@@ -117,7 +119,6 @@ function parseM3U(content) {
       }
       const categoryId = categoryMap.get(categoryName);
 
-      // Channel name
       const nameParts = extinf.split(',');
       const channelName = nameParts[nameParts.length - 1].trim() || `Channel ${newChannels.length + 1}`;
 
@@ -141,7 +142,7 @@ function parseM3U(content) {
         tv_archive_duration: 0
       });
 
-      i++; // skip URL line
+      i++;
     }
   }
 
@@ -216,14 +217,12 @@ function authenticate(req, res, next) {
 
   console.log(`🔐 Auth attempt: username="${username}"`);
 
-  // Find user case-insensitively
   const actualUsername = Object.keys(users).find(u => u.toLowerCase() === username);
 
   if (actualUsername && users[actualUsername].password === password) {
     console.log(`✓ Auth success for: ${actualUsername}`);
     req.user = actualUsername;
 
-    // Load user's M3U if not already loaded
     if (!userChannels[actualUsername]) {
       console.log(`First login for ${actualUsername}, loading M3U...`);
       loadUserM3U(actualUsername)
@@ -247,10 +246,7 @@ function authenticate(req, res, next) {
   }
 }
 
-/**
- * DEBUG: Inspect direct_source URLs for a user
- * /debug/streams?username=main&password=admin&contains=defaultgen.com:5050&limit=10
- */
+// DEBUG: Inspect direct_source URLs for a user
 app.get('/debug/streams', authenticate, (req, res) => {
   const contains = req.query.contains || '';
   const limit = Math.max(1, Math.min(parseInt(req.query.limit || '20', 10), 200));
@@ -282,10 +278,7 @@ app.get('/debug/streams', authenticate, (req, res) => {
   });
 });
 
-/**
- * DEBUG: Probe a single provider URL FROM Render (confirms 401 blocks)
- * /debug/probe?username=main&password=admin&url=http://provider:port/live/USER/PASS/ID.ts
- */
+// DEBUG: Probe a single provider URL
 app.get('/debug/probe', authenticate, (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'Missing url=' });
@@ -316,19 +309,11 @@ app.get('/debug/probe', authenticate, (req, res) => {
   upstreamReq.end();
 });
 
-/**
- * STREAM ENDPOINT (NO PROXYING):
- * - Validates user/pass
- * - Finds the channel by stream_id
- * - ALWAYS redirects to provider URL
- *
- * This keeps Render bandwidth near-zero for video.
- */
+// STREAM ENDPOINT — always 302 redirects, no proxying
 app.get('/live/:username/:password/:stream_id', (req, res) => {
   const { username, password, stream_id } = req.params;
   const usernameLower = username.toLowerCase();
 
-  // Case-insensitive auth for streams
   const actualUsername = Object.keys(users).find(u => u.toLowerCase() === usernameLower);
 
   if (!actualUsername || users[actualUsername].password !== password) {
@@ -351,7 +336,6 @@ app.get('/live/:username/:password/:stream_id', (req, res) => {
   const streamUrl = channel.direct_source;
   console.log(`↪️ Redirecting to provider: ${channel.name} -> ${getHost(streamUrl)}`);
 
-  // 302 is broadly supported by IPTV apps/tools.
   return res.redirect(302, streamUrl);
 });
 
@@ -365,7 +349,10 @@ app.get('/player_api.php', authenticate, (req, res) => {
   const channels = userChannels[req.user] || [];
   const categories = userCategories[req.user] || [];
 
-  // Default response (login check)
+  const baseUrl = getPublicBaseUrl(req);
+  const urlObj = new URL(baseUrl);
+  const isHttps = urlObj.protocol === 'https:';
+
   if (!action) {
     const response = {
       user_info: {
@@ -385,10 +372,10 @@ app.get('/player_api.php', authenticate, (req, res) => {
         xui: true,
         version: '1.0.0',
         revision: 1,
-        url: 'xtream-bridge.onrender.com',
-        port: '443',
+        url: urlObj.hostname,
+        port: isHttps ? '443' : (urlObj.port || '80'),
         https_port: '443',
-        server_protocol: 'https',
+        server_protocol: urlObj.protocol.replace(':', ''),
         rtmp_port: '1935',
         timezone: 'UTC',
         timestamp_now: Math.floor(Date.now() / 1000),
@@ -424,10 +411,7 @@ app.post('/player_api.php', authenticate, (req, res) => {
   app._router.handle(req, res);
 });
 
-/**
- * Get M3U file (stable bridge URLs)
- * Your /live/... will redirect to provider, so no video proxying happens.
- */
+// Get M3U file (stable bridge URLs)
 app.get('/get.php', authenticate, (req, res) => {
   const username = req.query.username || req.body.username;
   const password = req.query.password || req.body.password;
@@ -435,8 +419,10 @@ app.get('/get.php', authenticate, (req, res) => {
   const channels = userChannels[req.user] || [];
   const categories = userCategories[req.user] || [];
 
+  const baseUrl = getPublicBaseUrl(req);
+
   const m3uContent = channels.map(ch => {
-    const proxyUrl = `${SERVER_URL}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${ch.stream_id}.m3u8`;
+    const proxyUrl = `${baseUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${ch.stream_id}.m3u8`;
     const cat = categories.find(cat => cat.category_id === ch.category_id);
 
     return `#EXTINF:-1 tvg-id="${ch.epg_channel_id || ''}" tvg-logo="${ch.stream_icon}" group-title="${cat?.category_name || 'Uncategorized'}",${ch.name}\n${proxyUrl}`;
@@ -485,7 +471,8 @@ app.get('/xmltv.php', authenticate, async (req, res) => {
 
 // Start server and load all users
 app.listen(PORT, async () => {
-  console.log(`Server running on ${SERVER_URL}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Public URL: ${SERVER_URL}`);
   console.log(`API endpoint: ${SERVER_URL}/player_api.php`);
   console.log('');
   await loadAllUsers();
